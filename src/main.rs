@@ -3,8 +3,10 @@
 use clap::Parser;
 use colored::*;
 use eyre::{Context, Result};
+use fork::{Fork, daemon};
 use log::info;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 
 mod cli;
@@ -39,46 +41,107 @@ fn setup_logging() -> Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Parse CLI args first (before any async runtime)
+    let cli = Cli::parse();
+
+    // Check if this is a daemon command that needs to fork
+    if let Some(Command::Daemon { foreground: false }) = &cli.command {
+        // Daemonize BEFORE starting tokio runtime
+        let config = Config::load(cli.config.as_ref()).context("Failed to load configuration")?;
+        let daemon_config = config.to_daemon_config();
+
+        if is_daemon_running(&daemon_config) {
+            eprintln!("{} Daemon is already running", "!".yellow());
+            return Ok(());
+        }
+
+        return daemonize(&daemon_config);
+    }
+
+    // For all other commands, run with tokio
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async_main(cli))
+}
+
+async fn async_main(cli: Cli) -> Result<()> {
     setup_logging().context("Failed to setup logging")?;
 
-    let cli = Cli::parse();
     let config = Config::load(cli.config.as_ref()).context("Failed to load configuration")?;
 
     info!("Starting with config from: {:?}", cli.config);
 
     match cli.command {
-        Some(Command::Daemon { foreground }) => run_daemon(&config, foreground).await,
-        Some(cmd) => run_client_command(&config, cmd).await,
-        None => {
-            // Default: show status
-            show_status(&config).await
+        Some(Command::Daemon { foreground: true }) => {
+            // Foreground daemon mode
+            let daemon_config = config.to_daemon_config();
+            if is_daemon_running(&daemon_config) {
+                eprintln!("{} Daemon is already running", "!".yellow());
+                return Ok(());
+            }
+            println!("{} Starting daemon in foreground...", "→".blue());
+            let daemon = Daemon::new(daemon_config)?;
+            daemon.run().await?;
+            Ok(())
         }
+        Some(Command::Daemon { foreground: false }) => {
+            // This shouldn't be reached (handled in main), but just in case
+            unreachable!("Background daemon should be handled before tokio starts")
+        }
+        Some(cmd) => run_client_command(&config, cmd).await,
+        None => show_status(&config).await,
     }
 }
 
-async fn run_daemon(config: &Config, foreground: bool) -> Result<()> {
-    let daemon_config = config.to_daemon_config();
+fn daemonize(daemon_config: &neuraphage::DaemonConfig) -> Result<()> {
+    // Use the fork crate for proper double-fork daemonization.
+    // This is the recommended approach per tokio maintainers:
+    // "You must create the Tokio runtime after daemonizing it.
+    //  The Tokio runtime can't survive a fork."
+    // See: https://users.rust-lang.org/t/tokio-0-2-and-daemonize-process/42427
+    //
+    // The fork crate's daemon() function:
+    // - Performs double-fork (parent -> child -> grandchild)
+    // - Calls setsid() to create new session
+    // - Changes working directory to / (when nochdir=false)
+    // - Redirects stdio to /dev/null (when noclose=false)
+    // - Uses _exit to avoid running destructors post-fork (POSIX-safe)
 
-    if is_daemon_running(&daemon_config) {
-        eprintln!("{} Daemon is already running", "!".yellow());
-        return Ok(());
+    match daemon(false, false) {
+        Ok(Fork::Child) => {
+            // We are now the daemon process (grandchild after double-fork)
+            // Safe to create tokio runtime here
+
+            // Write PID file
+            let pid = std::process::id();
+            let pid_file = daemon_config.socket_path.with_extension("pid");
+            if let Some(parent) = pid_file.parent() {
+                fs::create_dir_all(parent).ok();
+            }
+            if let Ok(mut f) = fs::File::create(&pid_file) {
+                writeln!(f, "{}", pid).ok();
+            }
+
+            // Setup logging for daemon
+            setup_logging().ok();
+
+            // Create tokio runtime and run the daemon
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                let daemon = Daemon::new(daemon_config.clone())?;
+                daemon.run().await?;
+                Ok::<(), eyre::Error>(())
+            })?;
+
+            Ok(())
+        }
+        Ok(Fork::Parent(_)) => {
+            // Parent process - daemon forked successfully
+            println!("{} Daemon started in background", "✓".green());
+            std::process::exit(0);
+        }
+        Err(e) => Err(eyre::eyre!("Failed to daemonize: {:?}", e)),
     }
-
-    if !foreground {
-        // TODO: Implement proper daemonization
-        eprintln!(
-            "{} Background mode not yet implemented, running in foreground",
-            "!".yellow()
-        );
-    }
-
-    println!("{} Starting neuraphage daemon...", "→".blue());
-    let daemon = Daemon::new(daemon_config)?;
-    daemon.run().await?;
-
-    Ok(())
 }
 
 async fn run_client_command(config: &Config, command: Command) -> Result<()> {
@@ -87,7 +150,7 @@ async fn run_client_command(config: &Config, command: Command) -> Result<()> {
     // Check if daemon is running, start if needed
     if !is_daemon_running(&daemon_config) {
         if config.daemon.auto_start {
-            eprintln!("{} Daemon not running. Start with: neuraphage daemon", "!".yellow());
+            eprintln!("{} Daemon not running. Start with: np daemon", "!".yellow());
             return Ok(());
         } else {
             eprintln!("{} Daemon not running", "!".red());
@@ -222,7 +285,7 @@ async fn show_status(config: &Config) -> Result<()> {
         }
     } else {
         println!("{} Daemon is not running", "○".yellow());
-        println!("Start with: {} daemon", "neuraphage".cyan());
+        println!("Start with: {} daemon", "np".cyan());
     }
 
     Ok(())
