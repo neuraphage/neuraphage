@@ -8,8 +8,8 @@ use std::sync::LazyLock;
 fn generate_after_help() -> String {
     let mut lines = Vec::new();
 
-    // Required tools section
-    lines.push("REQUIRED TOOLS:".to_string());
+    // Required tools section (bold)
+    lines.push("\x1b[1mRequired Tools:\x1b[0m".to_string());
 
     // Check bwrap
     let bwrap_status = match std::process::Command::new("bwrap").arg("--version").output() {
@@ -23,18 +23,22 @@ fn generate_after_help() -> String {
     lines.push(bwrap_status);
 
     lines.push(String::new());
-    lines.push("Logs are written to: ~/.local/share/neuraphage/logs/neuraphage.log".to_string());
 
-    // Daemon status
+    // Daemon section (bold)
     let daemon_status = check_daemon_status();
+    lines.push(format!(
+        "\x1b[1mDaemon:\x1b[0m\n  {} {}",
+        daemon_status.0, daemon_status.1
+    ));
+
     lines.push(String::new());
-    lines.push(format!("Daemon status: {}", daemon_status));
+    lines.push("Logs are written to: ~/.local/share/neuraphage/logs/neuraphage.log".to_string());
 
     lines.join("\n")
 }
 
-/// Check if daemon is running and return status string.
-fn check_daemon_status() -> &'static str {
+/// Check if daemon is running and return (icon, status_text).
+fn check_daemon_status() -> (&'static str, &'static str) {
     let socket_path = dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("neuraphage")
@@ -43,12 +47,12 @@ fn check_daemon_status() -> &'static str {
     if socket_path.exists() {
         // Try to connect briefly
         if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
-            "✅"
+            ("✅", "running")
         } else {
-            "❌ (stale socket)"
+            ("❌", "stale socket")
         }
     } else {
-        "❌"
+        ("❌", "not running")
     }
 }
 
