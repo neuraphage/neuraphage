@@ -12,6 +12,7 @@ pub mod executor;
 pub mod personas;
 pub mod repl;
 pub mod safety;
+pub mod sandbox;
 pub mod task;
 pub mod task_manager;
 pub mod ui;
@@ -49,3 +50,6 @@ pub use repl::{Repl, ReplInput, Session};
 
 // Re-export safety types
 pub use safety::{SafetyCheckResult, SafetyChecker, SafetyConfig};
+
+// Re-export sandbox types
+pub use sandbox::{SandboxAvailability, SandboxConfig, SandboxMode};
