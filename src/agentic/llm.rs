@@ -229,4 +229,50 @@ mod tests {
             assert_eq!(response.content, "Always same");
         }
     }
+
+    #[tokio::test]
+    async fn test_default_stream_impl() {
+        // Test that the default stream() implementation works correctly
+        let client = MockLlmClient::new(vec![LlmResponse::text("Hello, world!")]);
+        let (tx, mut rx) = mpsc::channel::<StreamChunk>(10);
+
+        let response = client.stream("test", &[], &[], tx).await.unwrap();
+
+        // Response should contain the content
+        assert_eq!(response.content, "Hello, world!");
+
+        // Channel should have received TextDelta and MessageDone
+        let mut received_text = String::new();
+        let mut received_done = false;
+
+        while let Ok(chunk) = rx.try_recv() {
+            match chunk {
+                StreamChunk::TextDelta(text) => received_text.push_str(&text),
+                StreamChunk::MessageDone { .. } => received_done = true,
+                _ => {}
+            }
+        }
+
+        assert_eq!(received_text, "Hello, world!");
+        assert!(received_done);
+    }
+
+    #[tokio::test]
+    async fn test_default_stream_empty_response() {
+        // Test that empty content doesn't send TextDelta
+        let client = MockLlmClient::new(vec![LlmResponse::text("")]);
+        let (tx, mut rx) = mpsc::channel::<StreamChunk>(10);
+
+        let response = client.stream("test", &[], &[], tx).await.unwrap();
+        assert_eq!(response.content, "");
+
+        // Should only receive MessageDone (no TextDelta for empty content)
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+
+        assert_eq!(chunks.len(), 1);
+        assert!(matches!(chunks[0], StreamChunk::MessageDone { .. }));
+    }
 }

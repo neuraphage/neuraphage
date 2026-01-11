@@ -792,4 +792,114 @@ mod tests {
         assert_eq!(llm_response.tool_calls[0].name, "read_file");
         assert_eq!(llm_response.stop_reason, Some("tool_use".to_string()));
     }
+
+    #[test]
+    fn test_sse_message_start_parsing() {
+        let json =
+            r#"{"type":"message_start","message":{"id":"msg_123","usage":{"input_tokens":100,"output_tokens":0}}}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        match event {
+            StreamEvent::MessageStart { message } => {
+                assert_eq!(message.id, "msg_123");
+                assert_eq!(message.usage.unwrap().input_tokens, 100);
+            }
+            _ => panic!("Expected MessageStart"),
+        }
+    }
+
+    #[test]
+    fn test_sse_text_delta_parsing() {
+        let json = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        match event {
+            StreamEvent::ContentBlockDelta { index, delta } => {
+                assert_eq!(index, 0);
+                match delta {
+                    DeltaData::TextDelta { text } => assert_eq!(text, "Hello"),
+                    _ => panic!("Expected TextDelta"),
+                }
+            }
+            _ => panic!("Expected ContentBlockDelta"),
+        }
+    }
+
+    #[test]
+    fn test_sse_tool_use_start_parsing() {
+        let json = r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_123","name":"read_file"}}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        match event {
+            StreamEvent::ContentBlockStart { index, content_block } => {
+                assert_eq!(index, 1);
+                match content_block {
+                    ContentBlockStartData::ToolUse { id, name } => {
+                        assert_eq!(id, "toolu_123");
+                        assert_eq!(name, "read_file");
+                    }
+                    _ => panic!("Expected ToolUse"),
+                }
+            }
+            _ => panic!("Expected ContentBlockStart"),
+        }
+    }
+
+    #[test]
+    fn test_sse_input_json_delta_parsing() {
+        let json = r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        match event {
+            StreamEvent::ContentBlockDelta { index, delta } => {
+                assert_eq!(index, 1);
+                match delta {
+                    DeltaData::InputJsonDelta { partial_json } => {
+                        assert_eq!(partial_json, "{\"path\":");
+                    }
+                    _ => panic!("Expected InputJsonDelta"),
+                }
+            }
+            _ => panic!("Expected ContentBlockDelta"),
+        }
+    }
+
+    #[test]
+    fn test_sse_message_delta_parsing() {
+        let json = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":50}}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        match event {
+            StreamEvent::MessageDelta { delta, usage } => {
+                assert_eq!(delta.stop_reason, Some("end_turn".to_string()));
+                assert_eq!(usage.unwrap().output_tokens, 50);
+            }
+            _ => panic!("Expected MessageDelta"),
+        }
+    }
+
+    #[test]
+    fn test_sse_error_parsing() {
+        let json = r#"{"type":"error","error":{"message":"Rate limit exceeded"}}"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        match event {
+            StreamEvent::Error { error } => {
+                assert_eq!(error.message, "Rate limit exceeded");
+            }
+            _ => panic!("Expected Error"),
+        }
+    }
+
+    #[test]
+    fn test_streaming_tool_use_json_accumulation() {
+        // Test accumulating fragmented JSON for tool use
+        let mut tool = StreamingToolUse {
+            id: "toolu_123".to_string(),
+            name: "read_file".to_string(),
+            json_buffer: String::new(),
+        };
+
+        // Simulate receiving JSON fragments
+        tool.json_buffer.push_str("{\"path\":");
+        tool.json_buffer.push_str("\"test.txt\"}");
+
+        // Parse the accumulated JSON
+        let args: serde_json::Value = serde_json::from_str(&tool.json_buffer).unwrap();
+        assert_eq!(args["path"], "test.txt");
+    }
 }
