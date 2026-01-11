@@ -127,6 +127,8 @@ pub struct ToolContext {
     pub working_dir: PathBuf,
     /// Files that have been read in this session (for Edit validation).
     pub read_files: Arc<Mutex<HashSet<PathBuf>>>,
+    /// Whether sandbox is enabled for command execution.
+    pub sandbox_enabled: bool,
 }
 
 impl ToolContext {
@@ -134,6 +136,16 @@ impl ToolContext {
         Self {
             working_dir,
             read_files: Arc::new(Mutex::new(HashSet::new())),
+            sandbox_enabled: false,
+        }
+    }
+
+    /// Create a new context with sandboxing enabled.
+    pub fn with_sandbox(working_dir: PathBuf, sandbox_enabled: bool) -> Self {
+        Self {
+            working_dir,
+            read_files: Arc::new(Mutex::new(HashSet::new())),
+            sandbox_enabled,
         }
     }
 
@@ -176,6 +188,29 @@ impl ToolExecutor {
     /// Create a new tool executor with custom search config.
     pub fn with_search_config(working_dir: PathBuf, search_config: SearchConfig) -> Self {
         let context = ToolContext::new(working_dir);
+        let tools = Self::default_tools();
+        Self {
+            context,
+            tools,
+            search_config,
+        }
+    }
+
+    /// Create a new tool executor with sandbox enabled.
+    pub fn with_sandbox(working_dir: PathBuf, sandbox_enabled: bool) -> Self {
+        let context = ToolContext::with_sandbox(working_dir, sandbox_enabled);
+        let tools = Self::default_tools();
+        let search_config = SearchConfig::default();
+        Self {
+            context,
+            tools,
+            search_config,
+        }
+    }
+
+    /// Create a new tool executor with all options.
+    pub fn with_options(working_dir: PathBuf, search_config: SearchConfig, sandbox_enabled: bool) -> Self {
+        let context = ToolContext::with_sandbox(working_dir, sandbox_enabled);
         let tools = Self::default_tools();
         Self {
             context,

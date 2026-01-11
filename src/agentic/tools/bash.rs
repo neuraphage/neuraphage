@@ -4,6 +4,7 @@ use serde_json::Value;
 
 use super::{Tool, ToolContext, ToolResult};
 use crate::error::Result;
+use crate::sandbox::{self, SandboxAvailability, SandboxConfig};
 
 /// Bash tool - runs shell commands.
 pub struct BashTool;
@@ -38,15 +39,29 @@ impl BashTool {
 
         let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_i64()).unwrap_or(120_000) as u64;
 
-        let output = tokio::time::timeout(
-            std::time::Duration::from_millis(timeout_ms),
-            tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(command)
-                .current_dir(&ctx.working_dir)
-                .output(),
-        )
-        .await;
+        // Determine if we should use sandboxing
+        let use_sandbox =
+            ctx.sandbox_enabled && matches!(sandbox::check_availability(), SandboxAvailability::Available);
+
+        let output = if use_sandbox {
+            // Run command in sandbox
+            let config = SandboxConfig::for_working_dir(&ctx.working_dir);
+            let mut cmd = sandbox::wrap_command_async(&config, command);
+            cmd.current_dir(&ctx.working_dir);
+
+            tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), cmd.output()).await
+        } else {
+            // Run command directly
+            tokio::time::timeout(
+                std::time::Duration::from_millis(timeout_ms),
+                tokio::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(command)
+                    .current_dir(&ctx.working_dir)
+                    .output(),
+            )
+            .await
+        };
 
         match output {
             Ok(Ok(output)) => {
@@ -78,6 +93,12 @@ mod tests {
     fn setup() -> (TempDir, ToolContext) {
         let temp = TempDir::new().unwrap();
         let ctx = super::super::ToolContext::new(temp.path().to_path_buf());
+        (temp, ctx)
+    }
+
+    fn setup_with_sandbox() -> (TempDir, ToolContext) {
+        let temp = TempDir::new().unwrap();
+        let ctx = super::super::ToolContext::with_sandbox(temp.path().to_path_buf(), true);
         (temp, ctx)
     }
 
@@ -116,5 +137,34 @@ mod tests {
         .await
         .unwrap();
         assert!(result.output.contains("timed out"));
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires bwrap to be installed
+    async fn test_run_command_sandboxed() {
+        let (_temp, ctx) = setup_with_sandbox();
+
+        let result = BashTool::execute(&ctx, &serde_json::json!({"command": "echo hello"}))
+            .await
+            .unwrap();
+        assert!(result.output.contains("Exit code: 0"));
+        assert!(result.output.contains("hello"));
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires bwrap to be installed
+    async fn test_sandboxed_cannot_access_home_ssh() {
+        let (_temp, ctx) = setup_with_sandbox();
+
+        // Try to access ~/.ssh - should fail in sandbox
+        let result = BashTool::execute(&ctx, &serde_json::json!({"command": "ls ~/.ssh"}))
+            .await
+            .unwrap();
+        // Should fail because ~/.ssh is not mounted in the sandbox
+        assert!(
+            result.output.contains("Exit code: 1") || result.output.contains("Exit code: 2"),
+            "Expected failure accessing ~/.ssh in sandbox, got: {}",
+            result.output
+        );
     }
 }
