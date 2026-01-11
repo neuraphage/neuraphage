@@ -12,11 +12,11 @@ use std::panic;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crossterm::cursor::{MoveToColumn, MoveToRow, RestorePosition, SavePosition};
+use crossterm::cursor::{MoveToColumn, MoveToRow};
 use crossterm::execute;
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
 use crossterm::terminal::{
-    self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    self, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 
 use crate::error::Result;
@@ -243,8 +243,6 @@ pub struct ReplDisplay {
     is_tty: bool,
     rows: u16,
     cols: u16,
-    /// Track if we're at the start of a line (for column 0 enforcement).
-    at_line_start: bool,
 }
 
 impl ReplDisplay {
@@ -294,7 +292,6 @@ impl ReplDisplay {
             is_tty,
             rows,
             cols,
-            at_line_start: true, // Start at line start
         };
 
         // Draw initial status bar
@@ -318,19 +315,11 @@ impl ReplDisplay {
     pub fn print_content(&mut self, text: &str) -> Result<()> {
         let mut out = stdout();
         if self.raw_mode_enabled {
-            // In raw mode, need \r\n for newlines
-            // Use \r before each line to ensure column 0 (belt-and-suspenders
-            // for cases where RestorePosition might leave cursor offset)
+            // In raw mode, convert \n to \r\n for proper line breaks
             for c in text.chars() {
                 if c == '\n' {
                     write!(out, "\r\n")?;
-                    self.at_line_start = true;
                 } else {
-                    // If at line start, ensure we're at column 0
-                    if self.at_line_start {
-                        write!(out, "\r")?;
-                        self.at_line_start = false;
-                    }
                     write!(out, "{}", c)?;
                 }
             }
@@ -341,13 +330,19 @@ impl ReplDisplay {
         Ok(())
     }
 
-    /// Print a complete line.
+    /// Print a complete line (handles embedded newlines in raw mode).
     pub fn println(&mut self, line: &str) -> Result<()> {
         let mut out = stdout();
         if self.raw_mode_enabled {
-            // Ensure we start at column 0, then print line
-            write!(out, "\r{}\r\n", line)?;
-            self.at_line_start = true;
+            // Convert any embedded \n to \r\n for raw mode
+            for c in line.chars() {
+                if c == '\n' {
+                    write!(out, "\r\n")?;
+                } else {
+                    write!(out, "{}", c)?;
+                }
+            }
+            write!(out, "\r\n")?;
         } else {
             writeln!(out, "{}", line)?;
         }
@@ -356,10 +351,16 @@ impl ReplDisplay {
     }
 
     /// Update status and redraw status bar.
+    /// NOTE: Skips redraw during streaming to avoid cursor position corruption.
     pub fn update_status(&mut self, status: StatusState) -> Result<()> {
+        let is_streaming = matches!(status.activity, Activity::Streaming);
+
         self.status = status;
         self.frame = self.frame.wrapping_add(1);
-        if self.is_tty {
+
+        // Only redraw status bar when NOT actively streaming
+        // The save/restore cursor during streaming corrupts cursor position
+        if self.is_tty && !is_streaming {
             self.draw_status_bar()?;
         }
         Ok(())
@@ -382,17 +383,26 @@ impl ReplDisplay {
         // Truncate if needed
         let display_text: String = status_text.chars().take(self.cols as usize).collect();
 
+        // Save cursor position (using CSI s)
+        write!(out, "\x1b[s")?;
+
+        // Move to status bar row (1-indexed for ANSI)
+        write!(out, "\x1b[{};1H", self.rows)?;
+
+        // Clear line
+        write!(out, "\x1b[2K")?;
+
+        // Set color and print
         execute!(
             out,
-            SavePosition,
-            MoveToRow(self.rows - 1),
-            MoveToColumn(0),
-            Clear(ClearType::CurrentLine),
             SetForegroundColor(color),
             Print(&display_text),
             ResetColor,
-            RestorePosition,
         )?;
+
+        // Restore cursor position (using CSI u)
+        write!(out, "\x1b[u")?;
+
         out.flush()?;
         Ok(())
     }
