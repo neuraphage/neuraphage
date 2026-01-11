@@ -8,6 +8,72 @@ use serde_json::Value;
 use super::{Tool, ToolResult};
 use crate::error::Result;
 
+/// Sanitize external content to prevent injection attacks and formatting issues.
+/// Removes ANSI escape codes, normalizes whitespace, and limits length.
+fn sanitize_external_content(s: &str, max_len: usize) -> String {
+    // Remove ANSI escape sequences (CSI sequences like \x1b[...m)
+    let mut result = String::new();
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip escape sequence
+            if chars.peek() == Some(&'[') {
+                chars.next(); // consume '['
+                // Skip until we hit a letter (the terminator)
+                while let Some(&next) = chars.peek() {
+                    chars.next();
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else if c == '\r' {
+            // Skip carriage returns
+        } else if c == '\t' {
+            // Convert tabs to spaces
+            result.push(' ');
+        } else if c.is_control() && c != '\n' {
+            // Skip other control characters except newlines
+        } else {
+            result.push(c);
+        }
+    }
+
+    // Normalize multiple spaces/newlines
+    let mut prev_space = false;
+    let mut prev_newline = false;
+    let mut normalized = String::new();
+
+    for c in result.chars() {
+        if c == ' ' {
+            if !prev_space {
+                normalized.push(c);
+            }
+            prev_space = true;
+            prev_newline = false;
+        } else if c == '\n' {
+            if !prev_newline {
+                normalized.push(c);
+            }
+            prev_newline = true;
+            prev_space = false;
+        } else {
+            normalized.push(c);
+            prev_space = false;
+            prev_newline = false;
+        }
+    }
+
+    // Trim and truncate
+    let trimmed = normalized.trim();
+    if trimmed.len() > max_len {
+        format!("{}...", &trimmed[..max_len.saturating_sub(3)])
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Search backend configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -147,15 +213,16 @@ impl WebSearchTool {
                     return Ok(ToolResult::success("No results found."));
                 }
 
-                let mut output = format!("Found {} results:\n\n", results.len());
+                let mut output = format!("Found {} results:\n", results.len());
                 for (i, result) in results.iter().enumerate() {
-                    output.push_str(&format!(
-                        "{}. {}\n   {}\n   {}\n\n",
-                        i + 1,
-                        result.title,
-                        result.url,
-                        result.snippet
-                    ));
+                    // Compact format: less likely to trigger weird model formatting
+                    let title = result.title.trim();
+                    let url = result.url.trim();
+                    let snippet = result.snippet.trim();
+                    output.push_str(&format!("[{}] {} | {}\n", i + 1, title, url));
+                    if !snippet.is_empty() {
+                        output.push_str(&format!("    {}\n", snippet));
+                    }
                 }
                 Ok(ToolResult::success(output))
             }
@@ -214,9 +281,9 @@ impl WebSearchTool {
                         .unwrap_or("")
                         .to_string();
                     results.push(SearchResult {
-                        title: title.to_string(),
-                        url: url.to_string(),
-                        snippet,
+                        title: sanitize_external_content(title, 200),
+                        url: url.to_string(), // URLs should be kept as-is
+                        snippet: sanitize_external_content(&snippet, 500),
                     });
                 }
             }
@@ -271,11 +338,11 @@ impl WebSearchTool {
                     item.get("title").and_then(|t| t.as_str()),
                     item.get("url").and_then(|u| u.as_str()),
                 ) {
-                    let snippet = item.get("snippet").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                    let snippet = item.get("snippet").and_then(|s| s.as_str()).unwrap_or("");
                     results.push(SearchResult {
-                        title: title.to_string(),
-                        url: url.to_string(),
-                        snippet,
+                        title: sanitize_external_content(title, 200),
+                        url: url.to_string(), // URLs should be kept as-is
+                        snippet: sanitize_external_content(snippet, 500),
                     });
                 }
             }
@@ -314,11 +381,11 @@ impl WebSearchTool {
                     item.get("title").and_then(|t| t.as_str()),
                     item.get("url").and_then(|u| u.as_str()),
                 ) {
-                    let snippet = item.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                    let snippet = item.get("content").and_then(|c| c.as_str()).unwrap_or("");
                     results.push(SearchResult {
-                        title: title.to_string(),
-                        url: url.to_string(),
-                        snippet,
+                        title: sanitize_external_content(title, 200),
+                        url: url.to_string(), // URLs should be kept as-is
+                        snippet: sanitize_external_content(snippet, 500),
                     });
                 }
             }
@@ -371,6 +438,30 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("Test"));
         assert!(json.contains("https://example.com"));
+    }
+
+    #[test]
+    fn test_sanitize_external_content() {
+        // Basic trimming
+        assert_eq!(sanitize_external_content("  hello  ", 100), "hello");
+
+        // ANSI escape codes removed
+        assert_eq!(sanitize_external_content("\x1b[31mred\x1b[0m", 100), "red");
+
+        // Multiple spaces normalized
+        assert_eq!(sanitize_external_content("hello    world", 100), "hello world");
+
+        // Tabs converted to spaces
+        assert_eq!(sanitize_external_content("hello\tworld", 100), "hello world");
+
+        // Control chars removed
+        assert_eq!(sanitize_external_content("hello\x00world", 100), "helloworld");
+
+        // Truncation
+        assert_eq!(sanitize_external_content("hello world", 8), "hello...");
+
+        // Newlines preserved but normalized
+        assert_eq!(sanitize_external_content("a\n\n\nb", 100), "a\nb");
     }
 
     #[test]
