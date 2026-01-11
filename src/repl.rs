@@ -316,20 +316,18 @@ impl Repl {
                 tokens_used,
                 cost,
             } => {
-                // If we're in the middle of streaming text, go to a new line first
-                if *mid_line {
-                    println!();
-                    *mid_line = false;
+                // Don't interrupt streaming text with status updates
+                // Only show status when not actively streaming
+                if !*mid_line {
+                    print!(
+                        "\r{} Iteration {} | Tokens: {} | Cost: ${:.4}   ",
+                        "●".green(),
+                        iteration,
+                        tokens_used,
+                        cost
+                    );
+                    std::io::stdout().flush().ok();
                 }
-                // Update the status line with current iteration stats
-                print!(
-                    "\r{} Iteration {} | Tokens: {} | Cost: ${:.4}   ",
-                    "●".green(),
-                    iteration,
-                    tokens_used,
-                    cost
-                );
-                std::io::stdout().flush().ok();
             }
             ExecutionEventDto::LlmResponse { content } => {
                 if *mid_line {
@@ -381,25 +379,34 @@ impl Repl {
             }
             ExecutionEventDto::ActivityChanged { activity } => {
                 use crate::daemon::ActivityDto;
-                if *mid_line {
-                    println!();
-                    *mid_line = false;
-                }
-                let activity_str = match activity {
-                    ActivityDto::Thinking => "Thinking...",
-                    ActivityDto::Streaming => "Writing...",
+                // Tool execution activities should show (they naturally follow streaming)
+                match activity {
                     ActivityDto::ExecutingTool { name } => {
+                        if *mid_line {
+                            println!();
+                            *mid_line = false;
+                        }
                         println!("{} Running {}...", "⚙".blue(), name.cyan());
-                        return;
                     }
                     ActivityDto::WaitingForTool { name } => {
+                        if *mid_line {
+                            println!();
+                            *mid_line = false;
+                        }
                         println!("{} Waiting for {}...", "⏳".yellow(), name);
-                        return;
                     }
-                    ActivityDto::Idle => return,
-                };
-                print!("\r{} {}   ", "●".blue(), activity_str);
-                std::io::stdout().flush().ok();
+                    // Only show Thinking/Streaming when not already mid-output
+                    ActivityDto::Thinking => {
+                        if !*mid_line {
+                            print!("\r{} Thinking...   ", "●".blue());
+                            std::io::stdout().flush().ok();
+                        }
+                    }
+                    ActivityDto::Streaming => {
+                        // Don't show "Writing..." - the streaming text speaks for itself
+                    }
+                    ActivityDto::Idle => {}
+                }
             }
             ExecutionEventDto::ToolStarted { name } => {
                 if *mid_line {
