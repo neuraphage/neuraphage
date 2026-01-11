@@ -2,8 +2,8 @@
 
 **Author:** Claude (with Scott Idler)
 **Date:** 2026-01-11
-**Status:** Draft
-**Review Passes:** 4/5
+**Status:** In Review
+**Review Passes:** 5/5
 
 ## Summary
 
@@ -24,11 +24,21 @@ The current CLI structure is confusing because:
 3. **Flat namespace pollution**: All 19 commands compete at the top level, making help output overwhelming
 4. **Discoverability issues**: New users don't know that daemon commands exist or how they relate
 
-Current confused structure:
+**Before (current confused structure):**
 ```
 np daemon [-f]     # Start daemon
-np stop            # Stop daemon (but not nested under daemon)
-np ping            # Check daemon (but not nested under daemon)
+np stop            # Stop daemon (why not under daemon?)
+np ping            # Check daemon (why not under daemon?)
+np new ...
+np list ...
+```
+
+**After (proposed clean structure):**
+```
+np daemon start [-f]    # Start daemon
+np daemon stop          # Stop daemon
+np daemon status        # Check daemon (renamed from ping)
+np daemon restart [-f]  # Restart daemon (new)
 np new ...
 np list ...
 ```
@@ -406,24 +416,57 @@ async fn wait_for_daemon_stop(daemon_config: &DaemonConfig) {
 
 ### Implementation Plan
 
-#### Phase 1: Add DaemonCommand enum
-- Create `DaemonCommand` enum with `Start`, `Stop`, `Status`, `Restart` variants
-- Update `Command` enum to nest `Daemon(DaemonCommand)`
-- Keep old `Stop` and `Ping` variants temporarily for compatibility
+#### Phase 1: Update cli.rs
 
-#### Phase 2: Refactor main.rs handler
-- Create `handle_daemon_command()` function
-- Move daemon logic out of `run_client_command()`
-- Handle the special case of background daemonization in `main()`
+**File:** `src/cli.rs`
 
-#### Phase 3: Update help text and documentation
-- Rename `Ping` to `Status` (more intuitive)
-- Update any documentation/README
-- Update shell completions if applicable
+1. Add `DaemonCommand` enum after imports:
+   ```rust
+   #[derive(Subcommand)]
+   pub enum DaemonCommand {
+       Start { #[arg(short, long)] foreground: bool },
+       Stop,
+       Status,
+       Restart { #[arg(short, long)] foreground: bool },
+   }
+   ```
 
-#### Phase 4: Remove deprecated commands
-- Remove top-level `Stop` and `Ping` variants
-- Clean up any dead code
+2. Modify `Command` enum:
+   - Change `Daemon { foreground: bool }` to `Daemon(DaemonCommand)`
+   - Remove `Stop` variant
+   - Remove `Ping` variant
+
+#### Phase 2: Update main.rs
+
+**File:** `src/main.rs`
+
+1. Update `main()` to check for `Command::Daemon(DaemonCommand::Start { foreground: false })` and `Command::Daemon(DaemonCommand::Restart { foreground: false })`
+
+2. Update `async_main()` to route `Command::Daemon(cmd)` to new `handle_daemon_command()`
+
+3. Add `handle_daemon_command()` function with match arms for:
+   - `DaemonCommand::Start { foreground: true }` - foreground mode
+   - `DaemonCommand::Start { foreground: false }` - unreachable
+   - `DaemonCommand::Stop` - shutdown request
+   - `DaemonCommand::Status` - ping/status check
+   - `DaemonCommand::Restart { foreground: true }` - stop + start foreground
+   - `DaemonCommand::Restart { foreground: false }` - unreachable
+
+4. Add `wait_for_daemon_stop()` helper function
+
+5. Remove `Command::Stop` and `Command::Ping` handling from `run_client_command()`
+
+#### Phase 3: Update tests and documentation
+
+1. Update any CLI tests to use new command structure
+2. Update README if it documents CLI usage
+3. Regenerate shell completions if applicable
+
+#### Phase 4: Cleanup
+
+1. Remove any dead code from removed variants
+2. Run `cargo clippy` to catch any issues
+3. Run full test suite
 
 ### Expected Help Text Output
 
@@ -572,6 +615,80 @@ mod tests {
 }
 ```
 
+### Architectural Fit
+
+#### Module Structure
+
+The refactoring maintains the existing module boundaries:
+
+```
+src/
+├── main.rs      # CLI entry point and command routing (modified)
+├── cli.rs       # CLI definitions with clap derives (modified)
+├── daemon.rs    # Daemon implementation (unchanged)
+└── lib.rs       # Core types and exports (unchanged)
+```
+
+The change is purely in the CLI layer - no changes to `daemon.rs` or the core library. This is a good separation of concerns.
+
+#### Future Extensibility
+
+The nested subcommand pattern makes it easy to add more daemon operations:
+
+```rust
+#[derive(Subcommand)]
+pub enum DaemonCommand {
+    Start { foreground: bool },
+    Stop,
+    Status,
+    Restart { foreground: bool },
+
+    // Future additions:
+    /// View daemon logs
+    Logs {
+        /// Number of lines to show
+        #[arg(short, long, default_value = "50")]
+        lines: usize,
+        /// Follow log output
+        #[arg(short, long)]
+        follow: bool,
+    },
+    /// Reload daemon configuration
+    Reload,
+    /// Show daemon version and build info
+    Info,
+}
+```
+
+#### Consistency with Task Commands
+
+This design intentionally does NOT group task commands under `np task <cmd>`. However, the pattern established here could be applied later if desired:
+
+```rust
+// Current (after this refactor):
+np daemon start
+np new "task"
+np list
+
+// Possible future:
+np daemon start
+np task new "task"
+np task list
+```
+
+The current design keeps task commands at the top level for brevity since they are the primary use case. This is a deliberate trade-off.
+
+#### Handler Separation
+
+The design introduces a clear handler separation:
+
+1. `main()` - pre-tokio handling for background operations
+2. `async_main()` - routing to appropriate handlers
+3. `handle_daemon_command()` - daemon-specific logic
+4. `run_client_command()` - task-related client logic
+
+This improves code organization and makes each function's responsibility clearer.
+
 ### Rollout Plan
 
 1. Implement new structure
@@ -686,6 +803,31 @@ Socket creation may fail if the directory doesn't exist or isn't writable. The d
 - [ ] Should we add a `daemon logs` subcommand for viewing logs?
 - [ ] Should we support `np d start` as a shorthand alias for `np daemon start`?
 - [ ] Do we need backwards compatibility aliases for `np stop` -> `np daemon stop`?
+
+## Summary of Changes
+
+| File | Change |
+|------|--------|
+| `src/cli.rs` | Add `DaemonCommand` enum, modify `Command::Daemon` to use it, remove `Stop` and `Ping` |
+| `src/main.rs` | Update pre-tokio checks, add `handle_daemon_command()`, update routing |
+
+**Lines of code estimate:**
+- ~30 lines added to cli.rs (DaemonCommand enum + doc comments)
+- ~80 lines added to main.rs (handle_daemon_command function)
+- ~20 lines removed from main.rs (old Stop/Ping handling)
+- Net: ~90 lines added
+
+## Review Process Summary
+
+| Pass | Focus | Changes Made |
+|------|-------|--------------|
+| 1 | Completeness | Added pre-tokio constraint section, migration strategy, expected help output |
+| 2 | Correctness | Fixed async/sync handling for daemonize, added proper restart logic |
+| 3 | Edge Cases | Added section on stale sockets, missing subcommand, restart failures |
+| 4 | Architecture | Added module structure, future extensibility, handler separation analysis |
+| 5 | Clarity | Improved before/after comparison, made implementation phases more specific |
+
+**Document Status:** Ready for user review
 
 ## References
 

@@ -4,6 +4,8 @@
 //! content scrolls above it, similar to Claude Code's terminal UX.
 
 use std::io::{IsTerminal, Stdout, Write, stdout};
+use std::panic;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -14,6 +16,23 @@ use ratatui::widgets::Paragraph;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::error::Result;
+
+/// Global flag tracking if raw mode is enabled (for panic hook).
+static RAW_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Install panic hook to restore terminal state on panic.
+fn install_panic_hook() {
+    let original_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |panic_info| {
+        // Restore terminal state before printing panic
+        if RAW_MODE_ACTIVE.load(Ordering::SeqCst) {
+            let _ = disable_raw_mode();
+            RAW_MODE_ACTIVE.store(false, Ordering::SeqCst);
+        }
+        // Call original panic handler
+        original_hook(panic_info);
+    }));
+}
 
 /// Braille spinner frames for animated activity indicator.
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -137,8 +156,12 @@ impl ReplDisplay {
     /// Otherwise, falls back to simple printing.
     pub fn new() -> Result<Self> {
         if stdout().is_terminal() {
+            // Install panic hook to restore terminal on panic
+            install_panic_hook();
+
             // Enable raw mode for terminal control
             enable_raw_mode()?;
+            RAW_MODE_ACTIVE.store(true, Ordering::SeqCst);
 
             // Create terminal with inline viewport (1 line for status)
             let backend = CrosstermBackend::new(stdout());
@@ -281,6 +304,7 @@ impl ReplDisplay {
         if self.raw_mode_enabled {
             disable_raw_mode()?;
             self.raw_mode_enabled = false;
+            RAW_MODE_ACTIVE.store(false, Ordering::SeqCst);
         }
         Ok(())
     }
@@ -291,6 +315,7 @@ impl Drop for ReplDisplay {
         // Always try to restore terminal state
         if self.raw_mode_enabled {
             let _ = disable_raw_mode();
+            RAW_MODE_ACTIVE.store(false, Ordering::SeqCst);
         }
     }
 }
