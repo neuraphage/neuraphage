@@ -2,13 +2,64 @@
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::sync::LazyLock;
+
+/// Generate the after-help text with tool versions and daemon status.
+fn generate_after_help() -> String {
+    let mut lines = Vec::new();
+
+    // Required tools section
+    lines.push("REQUIRED TOOLS:".to_string());
+
+    // Check bwrap
+    let bwrap_status = match std::process::Command::new("bwrap").arg("--version").output() {
+        Ok(output) if output.status.success() => {
+            let version = String::from_utf8_lossy(&output.stdout);
+            let version = version.trim().replace("bubblewrap ", "");
+            format!("  ✅ bwrap      {}", version)
+        }
+        _ => "  ❌ bwrap      not installed".to_string(),
+    };
+    lines.push(bwrap_status);
+
+    lines.push(String::new());
+    lines.push("Logs are written to: ~/.local/share/neuraphage/logs/neuraphage.log".to_string());
+
+    // Daemon status
+    let daemon_status = check_daemon_status();
+    lines.push(String::new());
+    lines.push(format!("Daemon status: {}", daemon_status));
+
+    lines.join("\n")
+}
+
+/// Check if daemon is running and return status string.
+fn check_daemon_status() -> &'static str {
+    let socket_path = dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("neuraphage")
+        .join("neuraphage.sock");
+
+    if socket_path.exists() {
+        // Try to connect briefly
+        if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+            "✅"
+        } else {
+            "❌ (stale socket)"
+        }
+    } else {
+        "❌"
+    }
+}
+
+static AFTER_HELP: LazyLock<String> = LazyLock::new(generate_after_help);
 
 #[derive(Parser)]
 #[command(
     name = "neuraphage",
     about = "Multi-task AI orchestrator daemon",
     version = env!("GIT_DESCRIBE"),
-    after_help = "Logs are written to: ~/.local/share/neuraphage/logs/neuraphage.log"
+    after_help = AFTER_HELP.as_str()
 )]
 pub struct Cli {
     /// Path to config file
