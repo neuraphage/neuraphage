@@ -17,13 +17,15 @@ mod tools;
 use std::path::PathBuf;
 
 use log::{debug, info};
+use tokio::sync::mpsc;
 
 use crate::error::Result;
+use crate::executor::ExecutionEvent;
 use crate::task::Task;
 
 pub use anthropic::AnthropicClient;
 pub use conversation::{Conversation, Message, MessageRole};
-pub use llm::{LlmClient, LlmConfig, LlmResponse};
+pub use llm::{LlmClient, LlmConfig, LlmResponse, StreamChunk};
 pub use prompt::{PromptContext, SystemPrompt};
 pub use tools::{Tool, ToolCall, ToolExecutor, ToolResult};
 
@@ -83,11 +85,13 @@ pub struct AgenticLoop<L: LlmClient> {
     iteration: u32,
     tokens_used: u64,
     cost: f64,
+    /// Optional event sender for streaming text deltas.
+    event_tx: Option<mpsc::Sender<ExecutionEvent>>,
 }
 
 impl<L: LlmClient> AgenticLoop<L> {
     /// Create a new agentic loop.
-    pub fn new(config: AgenticConfig, llm: L) -> Result<Self> {
+    pub fn new(config: AgenticConfig, llm: L, event_tx: Option<mpsc::Sender<ExecutionEvent>>) -> Result<Self> {
         let conversation = Conversation::new(&config.conversation_path)?;
         let tools = ToolExecutor::new(config.working_dir.clone());
 
@@ -99,11 +103,12 @@ impl<L: LlmClient> AgenticLoop<L> {
             iteration: 0,
             tokens_used: 0,
             cost: 0.0,
+            event_tx,
         })
     }
 
     /// Load an existing conversation.
-    pub fn load(config: AgenticConfig, llm: L) -> Result<Self> {
+    pub fn load(config: AgenticConfig, llm: L, event_tx: Option<mpsc::Sender<ExecutionEvent>>) -> Result<Self> {
         let conversation = Conversation::load(&config.conversation_path)?;
         let tools = ToolExecutor::new(config.working_dir.clone());
 
@@ -115,6 +120,7 @@ impl<L: LlmClient> AgenticLoop<L> {
             iteration: 0,
             tokens_used: 0,
             cost: 0.0,
+            event_tx,
         })
     }
 
@@ -145,11 +151,37 @@ impl<L: LlmClient> AgenticLoop<L> {
         // Build the context
         let messages = self.build_context(task)?;
 
-        // Call the LLM
-        let response = self
-            .llm
-            .complete(&self.config.model, &messages, self.tools.available_tools())
-            .await?;
+        // Call the LLM (streaming or non-streaming based on event_tx)
+        let response = if let Some(event_tx) = &self.event_tx {
+            // Use streaming - forward text deltas as they arrive
+            let (chunk_tx, mut chunk_rx) = mpsc::channel::<StreamChunk>(100);
+            let event_tx_clone = event_tx.clone();
+
+            // Spawn a task to forward text deltas
+            let forward_task = tokio::spawn(async move {
+                while let Some(chunk) = chunk_rx.recv().await {
+                    if let StreamChunk::TextDelta(text) = chunk {
+                        let _ = event_tx_clone.send(ExecutionEvent::TextDelta { content: text }).await;
+                    }
+                }
+            });
+
+            // Call streaming API
+            let response = self
+                .llm
+                .stream(&self.config.model, &messages, self.tools.available_tools(), chunk_tx)
+                .await?;
+
+            // Wait for forwarding to complete
+            let _ = forward_task.await;
+
+            response
+        } else {
+            // Non-streaming call
+            self.llm
+                .complete(&self.config.model, &messages, self.tools.available_tools())
+                .await?
+        };
 
         // Update usage
         self.tokens_used += response.tokens_used;

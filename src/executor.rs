@@ -374,11 +374,11 @@ async fn execute_task(
     mut input_rx: mpsc::Receiver<String>,
     event_tx: mpsc::Sender<ExecutionEvent>,
 ) -> ExecutionResult {
-    // Create or load the agentic loop
+    // Create or load the agentic loop (passing event_tx for streaming)
     let loop_result = if config.conversation_path.exists() {
-        AgenticLoop::load(config.clone(), LlmClientWrapper(llm))
+        AgenticLoop::load(config.clone(), LlmClientWrapper(llm), Some(event_tx.clone()))
     } else {
-        AgenticLoop::new(config.clone(), LlmClientWrapper(llm))
+        AgenticLoop::new(config.clone(), LlmClientWrapper(llm), Some(event_tx.clone()))
     };
 
     let mut agentic_loop = match loop_result {
@@ -535,6 +535,16 @@ impl LlmClient for LlmClientWrapper {
         tools: &[crate::agentic::Tool],
     ) -> Result<crate::agentic::LlmResponse> {
         self.0.complete(model, messages, tools).await
+    }
+
+    async fn stream(
+        &self,
+        model: &str,
+        messages: &[crate::agentic::Message],
+        tools: &[crate::agentic::Tool],
+        chunk_tx: mpsc::Sender<crate::agentic::StreamChunk>,
+    ) -> Result<crate::agentic::LlmResponse> {
+        self.0.stream(model, messages, tools, chunk_tx).await
     }
 }
 
