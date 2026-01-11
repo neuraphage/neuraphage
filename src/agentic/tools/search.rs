@@ -13,11 +13,11 @@ use crate::error::Result;
 #[serde(rename_all = "snake_case")]
 pub enum SearchBackend {
     /// Brave Search API (free tier: 2k queries/month)
-    #[default]
     Brave,
     /// Kagi Search API (premium, $25/1k queries)
     Kagi,
-    /// Self-hosted SearXNG instance
+    /// Self-hosted SearXNG instance (no rate limits)
+    #[default]
     SearXNG,
 }
 
@@ -335,7 +335,7 @@ mod tests {
     #[test]
     fn test_search_config_default() {
         let config = SearchConfig::default();
-        assert!(matches!(config.backend, SearchBackend::Brave));
+        assert!(matches!(config.backend, SearchBackend::SearXNG));
         assert_eq!(config.max_results, 10);
         assert_eq!(config.searxng_url, "http://localhost:8080");
     }
@@ -379,5 +379,24 @@ mod tests {
         assert_eq!(url_encode("rust programming"), "rust+programming");
         assert_eq!(url_encode("test"), "test");
         assert_eq!(url_encode("a&b=c"), "a%26b%3Dc");
+    }
+
+    /// Integration test - requires SearXNG running at localhost:8080
+    #[tokio::test]
+    #[ignore]
+    async fn test_searxng_integration() {
+        let config = SearchConfig::default();
+        assert!(matches!(config.backend, SearchBackend::SearXNG));
+
+        let result = WebSearchTool::execute(
+            &config,
+            &serde_json::json!({"query": "rust programming language", "max_results": 3}),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_failure);
+        assert!(result.output.contains("rust") || result.output.contains("Rust"));
+        println!("SearXNG results:\n{}", result.output);
     }
 }
