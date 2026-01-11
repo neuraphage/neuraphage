@@ -7,6 +7,7 @@ mod control;
 mod edit;
 mod filesystem;
 mod grep;
+mod search;
 mod task;
 mod todo;
 mod user;
@@ -27,6 +28,7 @@ pub use control::ControlTools;
 pub use edit::EditTool;
 pub use filesystem::{GlobTool, ListDirectoryTool, ReadFileTool, WriteFileTool};
 pub use grep::GrepTool;
+pub use search::{SearchConfig, WebSearchTool};
 pub use task::TaskTool;
 pub use todo::TodoWriteTool;
 pub use user::AskUserTool;
@@ -154,6 +156,8 @@ pub struct ToolExecutor {
     context: ToolContext,
     /// Available tools.
     tools: Vec<Tool>,
+    /// Search configuration.
+    search_config: SearchConfig,
 }
 
 impl ToolExecutor {
@@ -161,7 +165,23 @@ impl ToolExecutor {
     pub fn new(working_dir: PathBuf) -> Self {
         let context = ToolContext::new(working_dir);
         let tools = Self::default_tools();
-        Self { context, tools }
+        let search_config = SearchConfig::default();
+        Self {
+            context,
+            tools,
+            search_config,
+        }
+    }
+
+    /// Create a new tool executor with custom search config.
+    pub fn with_search_config(working_dir: PathBuf, search_config: SearchConfig) -> Self {
+        let context = ToolContext::new(working_dir);
+        let tools = Self::default_tools();
+        Self {
+            context,
+            tools,
+            search_config,
+        }
     }
 
     /// Get available tools.
@@ -181,6 +201,7 @@ impl ToolExecutor {
             "run_command" => BashTool::execute(&self.context, &call.arguments).await,
             "ask_user" => AskUserTool::execute(&call.arguments).await,
             "web_fetch" => WebFetchTool::execute(&call.arguments).await,
+            "web_search" => WebSearchTool::execute(&self.search_config, &call.arguments).await,
             "spawn_task" => TaskTool::execute(&call.arguments).await,
             "todo_write" => TodoWriteTool::execute(&call.arguments).await,
             "complete_task" => ControlTools::complete(&call.arguments).await,
@@ -201,6 +222,7 @@ impl ToolExecutor {
             BashTool::definition(),
             AskUserTool::definition(),
             WebFetchTool::definition(),
+            WebSearchTool::definition(),
             TaskTool::definition(),
             TodoWriteTool::definition(),
             ControlTools::complete_definition(),
@@ -233,6 +255,7 @@ mod tests {
         assert!(tools.iter().any(|t| t.name == "run_command"));
         assert!(tools.iter().any(|t| t.name == "ask_user"));
         assert!(tools.iter().any(|t| t.name == "web_fetch"));
+        assert!(tools.iter().any(|t| t.name == "web_search"));
         assert!(tools.iter().any(|t| t.name == "spawn_task"));
         assert!(tools.iter().any(|t| t.name == "todo_write"));
         assert!(tools.iter().any(|t| t.name == "complete_task"));
