@@ -11,6 +11,7 @@
 pub mod anthropic;
 pub mod conversation;
 pub mod llm;
+mod prompt;
 mod tools;
 
 use std::path::PathBuf;
@@ -21,6 +22,7 @@ use crate::task::Task;
 pub use anthropic::AnthropicClient;
 pub use conversation::{Conversation, Message, MessageRole};
 pub use llm::{LlmClient, LlmConfig, LlmResponse};
+pub use prompt::{PromptContext, SystemPrompt};
 pub use tools::{Tool, ToolCall, ToolExecutor, ToolResult};
 
 /// Configuration for the agentic loop.
@@ -257,28 +259,9 @@ impl<L: LlmClient> AgenticLoop<L> {
 
     /// Build the system prompt for the task.
     fn build_system_prompt(&self, task: &Task) -> String {
-        let mut prompt = String::new();
-
-        prompt.push_str("You are an AI assistant executing a task.\n\n");
-        prompt.push_str(&format!("## Task\n{}\n\n", task.description));
-
-        if let Some(context) = &task.context {
-            prompt.push_str(&format!("## Context\n{}\n\n", context));
-        }
-
-        prompt.push_str(&format!(
-            "## Working Directory\n{}\n\n",
-            self.config.working_dir.display()
-        ));
-
-        prompt.push_str("## Instructions\n");
-        prompt.push_str("- Use the available tools to complete the task\n");
-        prompt.push_str("- Be thorough and verify your work\n");
-        prompt.push_str("- If you need user input, use the ask_user tool\n");
-        prompt.push_str("- When complete, use the complete_task tool\n");
-        prompt.push_str("- If you encounter an unrecoverable error, use the fail_task tool\n");
-
-        prompt
+        let context = PromptContext::from_environment(&self.config.working_dir);
+        let prompt_builder = SystemPrompt::new(context);
+        prompt_builder.build(task)
     }
 
     /// Save the conversation.
