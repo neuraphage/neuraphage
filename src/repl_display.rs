@@ -243,6 +243,8 @@ pub struct ReplDisplay {
     is_tty: bool,
     rows: u16,
     cols: u16,
+    /// Track if we're at the start of a line (for column 0 enforcement).
+    at_line_start: bool,
 }
 
 impl ReplDisplay {
@@ -292,6 +294,7 @@ impl ReplDisplay {
             is_tty,
             rows,
             cols,
+            at_line_start: true, // Start at line start
         };
 
         // Draw initial status bar
@@ -316,10 +319,18 @@ impl ReplDisplay {
         let mut out = stdout();
         if self.raw_mode_enabled {
             // In raw mode, need \r\n for newlines
+            // Use \r before each line to ensure column 0 (belt-and-suspenders
+            // for cases where RestorePosition might leave cursor offset)
             for c in text.chars() {
                 if c == '\n' {
                     write!(out, "\r\n")?;
+                    self.at_line_start = true;
                 } else {
+                    // If at line start, ensure we're at column 0
+                    if self.at_line_start {
+                        write!(out, "\r")?;
+                        self.at_line_start = false;
+                    }
                     write!(out, "{}", c)?;
                 }
             }
@@ -334,7 +345,9 @@ impl ReplDisplay {
     pub fn println(&mut self, line: &str) -> Result<()> {
         let mut out = stdout();
         if self.raw_mode_enabled {
-            write!(out, "{}\r\n", line)?;
+            // Ensure we start at column 0, then print line
+            write!(out, "\r{}\r\n", line)?;
+            self.at_line_start = true;
         } else {
             writeln!(out, "{}", line)?;
         }
