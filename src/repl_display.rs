@@ -140,7 +140,8 @@ pub struct ReplDisplay {
 
 impl ReplDisplay {
     /// Create a new display with scroll region.
-    pub fn new() -> Result<Self> {
+    /// If `prompt` is provided, it will be displayed at the top as "You: {prompt}".
+    pub fn new_with_prompt(prompt: Option<&str>) -> Result<Self> {
         let is_tty = stdout().is_terminal();
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
 
@@ -156,6 +157,26 @@ impl ReplDisplay {
             write!(out, "\x1b[1;{}r", rows - 1)?;
             // Move cursor to top
             execute!(out, MoveToRow(0), MoveToColumn(0))?;
+
+            // Display user's prompt at the top if provided
+            if let Some(p) = prompt {
+                // Truncate long prompts to fit on screen
+                let max_len = (cols as usize).saturating_sub(10);
+                let display_prompt = if p.len() > max_len {
+                    format!("{}...", &p[..max_len.saturating_sub(3)])
+                } else {
+                    p.to_string()
+                };
+                execute!(
+                    out,
+                    SetForegroundColor(Color::Cyan),
+                    Print("You: "),
+                    ResetColor,
+                    Print(&display_prompt),
+                    Print("\r\n\r\n")
+                )?;
+            }
+
             out.flush()?;
         }
 
@@ -177,6 +198,11 @@ impl ReplDisplay {
         }
 
         Ok(display)
+    }
+
+    /// Create a new display with scroll region (no initial prompt).
+    pub fn new() -> Result<Self> {
+        Self::new_with_prompt(None)
     }
 
     pub fn is_inline(&self) -> bool {

@@ -304,8 +304,8 @@ impl Repl {
         // Update session
         self.session.task_id = Some(TaskId(task_id.clone()));
 
-        // Wait for completion
-        self.wait_for_task(&task_id).await?;
+        // Wait for completion (pass message to display at top of screen)
+        self.wait_for_task(&task_id, Some(message)).await?;
 
         Ok(())
     }
@@ -412,9 +412,10 @@ impl Repl {
         }
     }
 
-    async fn wait_for_task(&mut self, task_id: &str) -> Result<()> {
+    async fn wait_for_task(&mut self, task_id: &str, prompt: Option<&str>) -> Result<()> {
         // Create the display - enters raw mode if TTY
-        let mut display = ReplDisplay::new()?;
+        // Show user's prompt at top of alternate screen
+        let mut display = ReplDisplay::new_with_prompt(prompt)?;
         let mut status = StatusState {
             task_started: Some(Instant::now()),
             ..Default::default()
