@@ -365,4 +365,52 @@ mod tests {
             .unwrap();
         assert!(!output.status.success());
     }
+
+    #[test]
+    fn test_sandbox_mode_serde() {
+        // Test serialization
+        assert_eq!(serde_json::to_string(&SandboxMode::Required).unwrap(), "\"required\"");
+        assert_eq!(serde_json::to_string(&SandboxMode::Preferred).unwrap(), "\"preferred\"");
+        assert_eq!(serde_json::to_string(&SandboxMode::Disabled).unwrap(), "\"disabled\"");
+
+        // Test deserialization
+        assert_eq!(
+            serde_json::from_str::<SandboxMode>("\"required\"").unwrap(),
+            SandboxMode::Required
+        );
+        assert_eq!(
+            serde_json::from_str::<SandboxMode>("\"preferred\"").unwrap(),
+            SandboxMode::Preferred
+        );
+        assert_eq!(
+            serde_json::from_str::<SandboxMode>("\"disabled\"").unwrap(),
+            SandboxMode::Disabled
+        );
+    }
+
+    #[test]
+    fn test_sandbox_config_env_passthrough() {
+        let config = SandboxConfig::default();
+        // Should include common environment variables
+        assert!(config.env_passthrough.contains(&"PATH".to_string()));
+        assert!(config.env_passthrough.contains(&"HOME".to_string()));
+        assert!(config.env_passthrough.contains(&"TERM".to_string()));
+    }
+
+    #[test]
+    fn test_build_args_includes_chdir() {
+        let config = SandboxConfig {
+            working_dir: PathBuf::from("/home/user/project"),
+            ..Default::default()
+        };
+        let args = config.build_args();
+
+        // Check that --chdir is included
+        let chdir_idx = args.iter().position(|a| a == "--chdir");
+        assert!(chdir_idx.is_some());
+        assert_eq!(
+            args.get(chdir_idx.unwrap() + 1),
+            Some(&"/home/user/project".to_string())
+        );
+    }
 }

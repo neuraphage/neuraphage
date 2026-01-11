@@ -1,5 +1,7 @@
 # Bubblewrap Sandboxing Design
 
+**Status: Implemented** (Phases 1-3, 5 complete; Phase 4 deferred)
+
 ## Overview
 
 This document describes the design for integrating bubblewrap (bwrap) sandboxing into neuraphage's command execution system. The goal is to provide defense-in-depth by isolating command execution at the kernel level, preventing accidental or malicious operations from affecting the host system.
