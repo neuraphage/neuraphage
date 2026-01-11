@@ -1,10 +1,14 @@
 [package]
 name = "neuraphage"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 authors = ["Scott Aidler"]
 build = "build.rs"
 description = "Multi-task AI orchestrator daemon with crash-recoverable architecture"
+
+[[bin]]
+name = "np"
+path = "src/main.rs"
 
 [dependencies]
 # Task graph persistence

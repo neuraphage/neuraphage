@@ -18,27 +18,27 @@ echo
 echo "Creating tasks with different priorities..."
 
 # Critical priority (0)
-neuraphage new "Fix security vulnerability" -p 0 -t security -t critical
+np new "Fix security vulnerability" -p 0 -t security -t critical
 
 # High priority (1)
-neuraphage new "Complete sprint deliverable" -p 1 -t sprint
+np new "Complete sprint deliverable" -p 1 -t sprint
 
 # Medium priority (2 - default)
-neuraphage new "Refactor legacy code" -t refactor
+np new "Refactor legacy code" -t refactor
 
 # Low priority (3)
-neuraphage new "Update development docs" -p 3 -t docs
+np new "Update development docs" -p 3 -t docs
 
 # Lowest priority (4)
-neuraphage new "Research new framework" -p 4 -t research
+np new "Research new framework" -p 4 -t research
 
 echo
 echo "All tasks (note priority column):"
-neuraphage list --all
+np list --all
 
 echo
 echo "Statistics:"
-neuraphage stats
+np stats
 
 echo
 echo "Done! The scheduler will process tasks by priority (0 first, then 1, etc.)"

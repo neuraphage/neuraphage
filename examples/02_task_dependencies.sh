@@ -12,42 +12,42 @@ echo
 echo "Creating task workflow..."
 
 # Design phase
-DESIGN=$(neuraphage new "Design database schema" -p 1 -t design | grep -oE 'eg-[a-f0-9]+')
+DESIGN=$(np new "Design database schema" -p 1 -t design | grep -oE 'eg-[a-f0-9]+')
 echo "Created design task: $DESIGN"
 
 # Implementation depends on design
-IMPL=$(neuraphage new "Implement database models" -p 2 -t impl | grep -oE 'eg-[a-f0-9]+')
+IMPL=$(np new "Implement database models" -p 2 -t impl | grep -oE 'eg-[a-f0-9]+')
 echo "Created impl task: $IMPL"
 
 # Testing depends on implementation
-TEST=$(neuraphage new "Write database integration tests" -p 2 -t testing | grep -oE 'eg-[a-f0-9]+')
+TEST=$(np new "Write database integration tests" -p 2 -t testing | grep -oE 'eg-[a-f0-9]+')
 echo "Created test task: $TEST"
 
 # Set up dependencies
 echo
 echo "Setting up dependencies..."
-neuraphage depend "$IMPL" "$DESIGN"  # impl blocked by design
-neuraphage depend "$TEST" "$IMPL"    # test blocked by impl
+np depend "$IMPL" "$DESIGN"  # impl blocked by design
+np depend "$TEST" "$IMPL"    # test blocked by impl
 
 # Show blocked tasks
 echo
 echo "Blocked tasks:"
-neuraphage blocked
+np blocked
 
 # Show ready tasks (only design should be ready)
 echo
 echo "Ready tasks (only design should be ready):"
-neuraphage ready
+np ready
 
 # Complete design task
 echo
 echo "Completing design task..."
-neuraphage close "$DESIGN" -s completed
+np close "$DESIGN" -s completed
 
 # Now impl should be ready
 echo
 echo "Ready tasks (impl should now be ready):"
-neuraphage ready
+np ready
 
 echo
 echo "Done!"
