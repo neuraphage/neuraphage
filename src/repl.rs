@@ -307,6 +307,21 @@ impl Repl {
     /// Handle a single execution event, updating display state.
     fn handle_event(event: &ExecutionEventDto, mid_line: &mut bool, should_break: &mut bool) {
         match event {
+            ExecutionEventDto::IterationComplete {
+                iteration,
+                tokens_used,
+                cost,
+            } => {
+                // Update the status line with current iteration stats
+                print!(
+                    "\r{} Iteration {} | Tokens: {} | Cost: ${:.4}   ",
+                    "●".green(),
+                    iteration,
+                    tokens_used,
+                    cost
+                );
+                std::io::stdout().flush().ok();
+            }
             ExecutionEventDto::LlmResponse { content } => {
                 if *mid_line {
                     println!();

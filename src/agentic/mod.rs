@@ -172,10 +172,14 @@ impl<L: LlmClient> AgenticLoop<L> {
 
             // Spawn a task to forward text deltas
             let forward_task = tokio::spawn(async move {
+                let mut chunk_count = 0;
                 while let Some(chunk) = chunk_rx.recv().await {
+                    chunk_count += 1;
+                    debug!("Received chunk {}: {:?}", chunk_count, chunk);
                     if let StreamChunk::TextDelta(text) = chunk {
                         // Signal streaming started on first chunk
                         if first_chunk {
+                            debug!("First text delta, sending Streaming activity");
                             let _ = event_tx_activity
                                 .send(ExecutionEvent::ActivityChanged {
                                     activity: crate::executor::Activity::Streaming,
@@ -183,9 +187,11 @@ impl<L: LlmClient> AgenticLoop<L> {
                                 .await;
                             first_chunk = false;
                         }
+                        debug!("Forwarding TextDelta: {} bytes", text.len());
                         let _ = event_tx_clone.send(ExecutionEvent::TextDelta { content: text }).await;
                     }
                 }
+                debug!("Forward task done, processed {} chunks", chunk_count);
             });
 
             // Call streaming API

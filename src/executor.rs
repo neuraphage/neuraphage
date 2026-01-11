@@ -833,6 +833,97 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_full_event_flow_with_streaming_mock() {
+        use crate::agentic::llm::MockLlmClient;
+        use crate::task::{Task, TaskStatus};
+        use tempfile::TempDir;
+
+        // Create mock LLM that sends streaming chunks
+        let mock_llm = MockLlmClient::new(vec![LlmResponse {
+            content: "Test streaming response".to_string(),
+            tool_calls: vec![],
+            stop_reason: Some("end_turn".to_string()),
+            tokens_used: 100,
+            cost: 0.01,
+        }]);
+
+        let temp_dir = TempDir::new().unwrap();
+        let config = ExecutorConfig {
+            max_concurrent: 5,
+            data_dir: temp_dir.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        // Create executor with mock LLM
+        let mut executor = TaskExecutor::with_llm(config, Arc::new(mock_llm));
+
+        // Create a test task
+        let now = chrono::Utc::now();
+        let task = Task {
+            id: TaskId("test-task".to_string()),
+            description: "Test task".to_string(),
+            context: None,
+            status: TaskStatus::Running,
+            priority: 5,
+            tags: vec![],
+            created_at: now,
+            updated_at: now,
+            closed_at: None,
+            close_reason: None,
+            parent_id: None,
+            iteration: 0,
+            tokens_used: 0,
+            cost: 0.0,
+        };
+
+        // Start the task
+        executor.start_task(task).unwrap();
+
+        // Give the task time to execute (mock is fast)
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // Poll for events
+        let task_id = TaskId("test-task".to_string());
+        let events = executor.poll_events(&task_id).unwrap();
+
+        // We should have at least some events:
+        // - ActivityChanged (Thinking)
+        // - TextDelta events (from mock streaming)
+        // - ActivityChanged (Idle)
+        // - IterationComplete
+        assert!(
+            !events.is_empty(),
+            "Expected events but got none. Buffer should contain events from task execution."
+        );
+
+        // Verify we have TextDelta events
+        let text_deltas: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, ExecutionEvent::TextDelta { .. }))
+            .collect();
+        assert!(
+            !text_deltas.is_empty(),
+            "Expected TextDelta events but found none. Events: {:?}",
+            events
+        );
+
+        // Verify we have IterationComplete event
+        let iteration_completes: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, ExecutionEvent::IterationComplete { .. }))
+            .collect();
+        assert!(
+            !iteration_completes.is_empty(),
+            "Expected IterationComplete events but found none. Events: {:?}",
+            events
+        );
+
+        // Get state - should be updated from IterationComplete events
+        let state = executor.get_state(&task_id);
+        assert!(state.is_some(), "Task state should exist");
+    }
+
     #[test]
     fn test_event_buffer_replay() {
         use std::collections::VecDeque;
