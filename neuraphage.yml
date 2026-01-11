@@ -1,0 +1,4 @@
+# neuraphage.yml - Sample configuration file
+name: "John Doe"
+age: 30
+debug: false
