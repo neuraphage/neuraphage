@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::sandbox::SandboxMode;
+
 /// Neuraphage configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
@@ -21,6 +23,8 @@ pub struct Config {
     pub daemon: DaemonSettings,
     /// API configuration.
     pub api: ApiSettings,
+    /// Sandbox configuration.
+    pub sandbox: SandboxSettings,
 }
 
 impl Default for Config {
@@ -36,6 +40,7 @@ impl Default for Config {
             debug: false,
             daemon: DaemonSettings::default(),
             api: ApiSettings::default(),
+            sandbox: SandboxSettings::default(),
         }
     }
 }
@@ -147,6 +152,34 @@ impl Default for ApiSettings {
     }
 }
 
+/// Sandbox settings for command execution isolation.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SandboxSettings {
+    /// Sandbox mode: required, preferred (default), or disabled.
+    pub mode: SandboxMode,
+    /// Isolate network by default.
+    pub isolate_network: bool,
+    /// Isolate PID namespace by default.
+    pub isolate_pids: bool,
+    /// Additional paths to allow read-write access.
+    pub extra_rw_paths: Vec<PathBuf>,
+    /// Additional paths to allow read-only access.
+    pub extra_ro_paths: Vec<PathBuf>,
+}
+
+impl Default for SandboxSettings {
+    fn default() -> Self {
+        Self {
+            mode: SandboxMode::Preferred,
+            isolate_network: true,
+            isolate_pids: true,
+            extra_rw_paths: Vec::new(),
+            extra_ro_paths: Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +238,40 @@ api:
     fn test_default_when_no_config() {
         let config = Config::load(None).unwrap();
         assert_eq!(config.max_concurrent_tasks, 5);
+    }
+
+    #[test]
+    fn test_sandbox_settings_default() {
+        let settings = SandboxSettings::default();
+        assert_eq!(settings.mode, SandboxMode::Preferred);
+        assert!(settings.isolate_network);
+        assert!(settings.isolate_pids);
+        assert!(settings.extra_rw_paths.is_empty());
+        assert!(settings.extra_ro_paths.is_empty());
+    }
+
+    #[test]
+    fn test_config_with_sandbox() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("config.yml");
+
+        let config_content = r#"
+sandbox:
+  mode: required
+  isolate_network: false
+  isolate_pids: true
+  extra_rw_paths:
+    - /home/user/.cargo
+  extra_ro_paths:
+    - /opt/tools
+"#;
+        fs::write(&config_path, config_content).unwrap();
+
+        let config = Config::load_from_file(&config_path).unwrap();
+        assert_eq!(config.sandbox.mode, SandboxMode::Required);
+        assert!(!config.sandbox.isolate_network);
+        assert!(config.sandbox.isolate_pids);
+        assert_eq!(config.sandbox.extra_rw_paths, vec![PathBuf::from("/home/user/.cargo")]);
+        assert_eq!(config.sandbox.extra_ro_paths, vec![PathBuf::from("/opt/tools")]);
     }
 }

@@ -6,6 +6,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use serde::{Deserialize, Serialize};
+
 /// Result of checking if sandboxing is available.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxAvailability {
@@ -18,7 +20,8 @@ pub enum SandboxAvailability {
 }
 
 /// Sandbox operating mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SandboxMode {
     /// Always use sandbox, fail if unavailable.
     Required,
