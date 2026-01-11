@@ -4,10 +4,32 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 use crate::agentic::conversation::Message;
 use crate::agentic::tools::{Tool, ToolCall};
 use crate::error::Result;
+
+/// A streaming chunk from the LLM.
+#[derive(Debug, Clone)]
+pub enum StreamChunk {
+    /// Text content delta.
+    TextDelta(String),
+    /// Tool use started (id and name known).
+    ToolUseStart { id: String, name: String },
+    /// Tool use input JSON fragment.
+    ToolUseDelta { id: String, json_delta: String },
+    /// Tool use complete (full input available).
+    ToolUseEnd { id: String },
+    /// Message complete - final usage stats.
+    MessageDone {
+        stop_reason: String,
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+    /// Error during streaming.
+    Error(String),
+}
 
 /// Configuration for the LLM client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +102,36 @@ impl LlmResponse {
 pub trait LlmClient: Send + Sync {
     /// Complete a conversation with the given messages and tools.
     async fn complete(&self, model: &str, messages: &[Message], tools: &[Tool]) -> Result<LlmResponse>;
+
+    /// Stream a conversation completion, sending chunks as they arrive.
+    ///
+    /// Default implementation falls back to non-streaming `complete()`.
+    async fn stream(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: &[Tool],
+        chunk_tx: mpsc::Sender<StreamChunk>,
+    ) -> Result<LlmResponse> {
+        // Default: fall back to non-streaming
+        let response = self.complete(model, messages, tools).await?;
+
+        // Send the full content as a single delta for compatibility
+        if !response.content.is_empty() {
+            let _ = chunk_tx.send(StreamChunk::TextDelta(response.content.clone())).await;
+        }
+
+        // Send completion
+        let _ = chunk_tx
+            .send(StreamChunk::MessageDone {
+                stop_reason: response.stop_reason.clone().unwrap_or_default(),
+                input_tokens: 0,
+                output_tokens: response.tokens_used,
+            })
+            .await;
+
+        Ok(response)
+    }
 }
 
 /// Mock LLM client for testing.

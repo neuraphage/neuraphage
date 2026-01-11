@@ -3,14 +3,17 @@
 //! Implements the `LlmClient` trait for calling Anthropic's Messages API.
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use reqwest::Client;
+use reqwest_eventsource::{Event, EventSource};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::env;
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 use crate::agentic::conversation::Message;
-use crate::agentic::llm::{LlmClient, LlmResponse};
+use crate::agentic::llm::{LlmClient, LlmResponse, StreamChunk};
 use crate::agentic::tools::{Tool, ToolCall};
 use crate::error::{Error, Result};
 
@@ -206,6 +209,166 @@ impl LlmClient for AnthropicClient {
 
         Err(last_error.unwrap_or_else(|| Error::Api("All retry attempts failed".to_string())))
     }
+
+    async fn stream(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: &[Tool],
+        chunk_tx: mpsc::Sender<StreamChunk>,
+    ) -> Result<LlmResponse> {
+        let (system, anthropic_messages) = self.convert_messages(messages);
+        let anthropic_tools = self.convert_tools(tools);
+
+        let request = AnthropicStreamRequest {
+            model: model.to_string(),
+            max_tokens: 4096,
+            messages: anthropic_messages,
+            system,
+            tools: if anthropic_tools.is_empty() { None } else { Some(anthropic_tools) },
+            stream: true,
+        };
+
+        let request_builder = self
+            .client
+            .post(format!("{}/v1/messages", self.base_url))
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("content-type", "application/json")
+            .json(&request);
+
+        let mut es = EventSource::new(request_builder)
+            .map_err(|e| Error::Api(format!("Failed to create event source: {}", e)))?;
+
+        // Accumulators for building the final response
+        let mut content = String::new();
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        let mut current_tools: Vec<StreamingToolUse> = Vec::new();
+        let mut stop_reason = None;
+        let mut input_tokens: u64 = 0;
+        let mut output_tokens: u64 = 0;
+
+        while let Some(event_result) = es.next().await {
+            match event_result {
+                Ok(Event::Open) => {
+                    // Connection opened, continue
+                }
+                Ok(Event::Message(message)) => {
+                    // Parse the SSE data
+                    let event: StreamEvent = match serde_json::from_str(&message.data) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            log::warn!("Failed to parse SSE event: {} - {}", e, message.data);
+                            continue;
+                        }
+                    };
+
+                    match event {
+                        StreamEvent::MessageStart { message: msg_data } => {
+                            if let Some(usage) = msg_data.usage {
+                                input_tokens = usage.input_tokens;
+                            }
+                        }
+                        StreamEvent::ContentBlockStart { index, content_block } => {
+                            match content_block {
+                                ContentBlockStartData::Text { .. } => {
+                                    // Text block started, nothing to accumulate yet
+                                }
+                                ContentBlockStartData::ToolUse { id, name } => {
+                                    // Ensure we have space for this tool
+                                    while current_tools.len() <= index {
+                                        current_tools.push(StreamingToolUse {
+                                            id: String::new(),
+                                            name: String::new(),
+                                            json_buffer: String::new(),
+                                        });
+                                    }
+                                    current_tools[index] = StreamingToolUse {
+                                        id: id.clone(),
+                                        name: name.clone(),
+                                        json_buffer: String::new(),
+                                    };
+                                    let _ = chunk_tx.send(StreamChunk::ToolUseStart { id, name }).await;
+                                }
+                            }
+                        }
+                        StreamEvent::ContentBlockDelta { index, delta } => match delta {
+                            DeltaData::TextDelta { text } => {
+                                content.push_str(&text);
+                                let _ = chunk_tx.send(StreamChunk::TextDelta(text)).await;
+                            }
+                            DeltaData::InputJsonDelta { partial_json } => {
+                                if index < current_tools.len() {
+                                    current_tools[index].json_buffer.push_str(&partial_json);
+                                    let _ = chunk_tx
+                                        .send(StreamChunk::ToolUseDelta {
+                                            id: current_tools[index].id.clone(),
+                                            json_delta: partial_json,
+                                        })
+                                        .await;
+                                }
+                            }
+                        },
+                        StreamEvent::ContentBlockStop { index } => {
+                            // If this was a tool use block, parse the accumulated JSON
+                            if index < current_tools.len() && !current_tools[index].id.is_empty() {
+                                let tool = &current_tools[index];
+                                let arguments: Value = serde_json::from_str(&tool.json_buffer)
+                                    .unwrap_or(Value::Object(serde_json::Map::new()));
+                                tool_calls.push(ToolCall {
+                                    id: tool.id.clone(),
+                                    name: tool.name.clone(),
+                                    arguments,
+                                });
+                                let _ = chunk_tx.send(StreamChunk::ToolUseEnd { id: tool.id.clone() }).await;
+                            }
+                        }
+                        StreamEvent::MessageDelta { delta, usage } => {
+                            stop_reason = delta.stop_reason;
+                            if let Some(u) = usage {
+                                output_tokens = u.output_tokens;
+                            }
+                        }
+                        StreamEvent::MessageStop => {
+                            let _ = chunk_tx
+                                .send(StreamChunk::MessageDone {
+                                    stop_reason: stop_reason.clone().unwrap_or_default(),
+                                    input_tokens,
+                                    output_tokens,
+                                })
+                                .await;
+                            break;
+                        }
+                        StreamEvent::Ping => {
+                            // Keep-alive, ignore
+                        }
+                        StreamEvent::Error { error } => {
+                            let _ = chunk_tx.send(StreamChunk::Error(error.message.clone())).await;
+                            return Err(Error::Api(format!("Stream error: {}", error.message)));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let error_msg = format!("SSE error: {}", e);
+                    let _ = chunk_tx.send(StreamChunk::Error(error_msg.clone())).await;
+                    return Err(Error::Api(error_msg));
+                }
+            }
+        }
+
+        // Close the event source
+        es.close();
+
+        // Build final response
+        let total_tokens = input_tokens + output_tokens;
+        Ok(LlmResponse {
+            content,
+            tool_calls,
+            stop_reason,
+            tokens_used: total_tokens,
+            cost: self.calculate_cost(input_tokens, output_tokens),
+        })
+    }
 }
 
 impl AnthropicClient {
@@ -300,6 +463,97 @@ struct AnthropicResponse {
 struct Usage {
     input_tokens: u64,
     output_tokens: u64,
+}
+
+// Streaming request (adds stream: true)
+#[derive(Debug, Serialize)]
+struct AnthropicStreamRequest {
+    model: String,
+    max_tokens: u32,
+    messages: Vec<AnthropicMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<AnthropicTool>>,
+    stream: bool,
+}
+
+// SSE event types for streaming
+// These types are constructed via serde deserialization, not directly
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum StreamEvent {
+    #[serde(rename = "message_start")]
+    MessageStart { message: MessageStartData },
+    #[serde(rename = "content_block_start")]
+    ContentBlockStart {
+        index: usize,
+        content_block: ContentBlockStartData,
+    },
+    #[serde(rename = "content_block_delta")]
+    ContentBlockDelta { index: usize, delta: DeltaData },
+    #[serde(rename = "content_block_stop")]
+    ContentBlockStop { index: usize },
+    #[serde(rename = "message_delta")]
+    MessageDelta {
+        delta: MessageDeltaData,
+        usage: Option<UsageDelta>,
+    },
+    #[serde(rename = "message_stop")]
+    MessageStop,
+    #[serde(rename = "ping")]
+    Ping,
+    #[serde(rename = "error")]
+    Error { error: StreamError },
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageStartData {
+    #[allow(dead_code)]
+    id: String,
+    usage: Option<Usage>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum ContentBlockStartData {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "tool_use")]
+    ToolUse { id: String, name: String },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum DeltaData {
+    #[serde(rename = "text_delta")]
+    TextDelta { text: String },
+    #[serde(rename = "input_json_delta")]
+    InputJsonDelta { partial_json: String },
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageDeltaData {
+    stop_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageDelta {
+    output_tokens: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamError {
+    message: String,
+}
+
+/// Accumulator for tool use blocks during streaming.
+struct StreamingToolUse {
+    id: String,
+    name: String,
+    json_buffer: String,
 }
 
 #[cfg(test)]
