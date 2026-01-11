@@ -11,7 +11,7 @@
 pub mod anthropic;
 pub mod conversation;
 pub mod llm;
-pub mod tools;
+mod tools;
 
 use std::path::PathBuf;
 

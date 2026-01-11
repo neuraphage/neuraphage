@@ -49,6 +49,11 @@ fork = "0.6.0"
 reqwest = { version = "0.13.1", features = ["json"] }
 ctrlc = "3.5.1"
 
+# Tools
+globwalk = "0.9"
+ignore = "0.4"
+regex = "1"
+
 [build-dependencies]
 
 [dev-dependencies]
