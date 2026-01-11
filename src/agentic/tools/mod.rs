@@ -7,7 +7,10 @@ mod control;
 mod edit;
 mod filesystem;
 mod grep;
+mod task;
+mod todo;
 mod user;
+mod web;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -24,7 +27,10 @@ pub use control::ControlTools;
 pub use edit::EditTool;
 pub use filesystem::{GlobTool, ListDirectoryTool, ReadFileTool, WriteFileTool};
 pub use grep::GrepTool;
+pub use task::TaskTool;
+pub use todo::TodoWriteTool;
 pub use user::AskUserTool;
+pub use web::WebFetchTool;
 
 /// Definition of a tool available to the agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +180,9 @@ impl ToolExecutor {
             "edit" => EditTool::execute(&self.context, &call.arguments).await,
             "run_command" => BashTool::execute(&self.context, &call.arguments).await,
             "ask_user" => AskUserTool::execute(&call.arguments).await,
+            "web_fetch" => WebFetchTool::execute(&call.arguments).await,
+            "spawn_task" => TaskTool::execute(&call.arguments).await,
+            "todo_write" => TodoWriteTool::execute(&call.arguments).await,
             "complete_task" => ControlTools::complete(&call.arguments).await,
             "fail_task" => ControlTools::fail(&call.arguments).await,
             _ => Ok(ToolResult::error(format!("Unknown tool: {}", call.name))),
@@ -191,6 +200,9 @@ impl ToolExecutor {
             EditTool::definition(),
             BashTool::definition(),
             AskUserTool::definition(),
+            WebFetchTool::definition(),
+            TaskTool::definition(),
+            TodoWriteTool::definition(),
             ControlTools::complete_definition(),
             ControlTools::fail_definition(),
         ]
@@ -220,6 +232,9 @@ mod tests {
         assert!(tools.iter().any(|t| t.name == "edit"));
         assert!(tools.iter().any(|t| t.name == "run_command"));
         assert!(tools.iter().any(|t| t.name == "ask_user"));
+        assert!(tools.iter().any(|t| t.name == "web_fetch"));
+        assert!(tools.iter().any(|t| t.name == "spawn_task"));
+        assert!(tools.iter().any(|t| t.name == "todo_write"));
         assert!(tools.iter().any(|t| t.name == "complete_task"));
         assert!(tools.iter().any(|t| t.name == "fail_task"));
     }

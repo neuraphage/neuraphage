@@ -50,6 +50,10 @@ pub enum Error {
     /// API/LLM error
     #[error("api error: {0}")]
     Api(String),
+
+    /// Network error
+    #[error("network error: {0}")]
+    Network(String),
 }
 
 impl From<eyre::Report> for Error {
