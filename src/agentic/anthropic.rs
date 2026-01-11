@@ -434,6 +434,35 @@ mod tests {
     }
 
     #[test]
+    fn test_convert_all_default_tools() {
+        use crate::agentic::tools::ToolExecutor;
+        use std::path::PathBuf;
+
+        let client = AnthropicClient {
+            client: Client::new(),
+            api_key: "test".to_string(),
+            base_url: "http://test".to_string(),
+        };
+
+        let executor = ToolExecutor::new(PathBuf::from("/tmp"));
+        let tools = executor.available_tools();
+        let anthropic_tools = client.convert_tools(tools);
+
+        // Should have 14 tools including web_search
+        assert_eq!(anthropic_tools.len(), 14);
+
+        // Verify web_search is present
+        let names: Vec<&str> = anthropic_tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"web_search"),
+            "web_search not found in tools: {:?}",
+            names
+        );
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"run_command"));
+    }
+
+    #[test]
     fn test_calculate_cost() {
         let client = AnthropicClient {
             client: Client::new(),
