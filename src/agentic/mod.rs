@@ -318,6 +318,29 @@ impl<L: LlmClient> AgenticLoop<L> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agentic::llm::{LlmResponse, MockLlmClient};
+    use crate::task::{Task, TaskId, TaskStatus};
+    use tempfile::TempDir;
+
+    fn make_test_task(id: &str) -> Task {
+        let now = chrono::Utc::now();
+        Task {
+            id: TaskId(id.to_string()),
+            description: "Test task".to_string(),
+            context: None,
+            status: TaskStatus::Running,
+            priority: 5,
+            tags: vec![],
+            created_at: now,
+            updated_at: now,
+            closed_at: None,
+            close_reason: None,
+            parent_id: None,
+            iteration: 0,
+            tokens_used: 0,
+            cost: 0.0,
+        }
+    }
 
     #[test]
     fn test_agentic_config_default() {
@@ -325,5 +348,144 @@ mod tests {
         assert_eq!(config.max_iterations, 100);
         assert_eq!(config.max_tokens, 1_000_000);
         assert_eq!(config.max_cost, 10.0);
+    }
+
+    #[tokio::test]
+    async fn test_iterate_with_streaming_forwards_text_deltas() {
+        // Create a mock LLM that returns a simple text response
+        let mock_llm = MockLlmClient::new(vec![LlmResponse {
+            content: "Hello from streaming test!".to_string(),
+            tool_calls: vec![],
+            stop_reason: Some("end_turn".to_string()),
+            tokens_used: 50,
+            cost: 0.001,
+        }]);
+
+        // Create temp directory for conversation
+        let temp_dir = TempDir::new().unwrap();
+        let conv_path = temp_dir.path().join("test_conv.json");
+
+        let config = AgenticConfig {
+            max_iterations: 10,
+            max_tokens: 10000,
+            max_cost: 1.0,
+            model: "test-model".to_string(),
+            working_dir: temp_dir.path().to_path_buf(),
+            conversation_path: conv_path,
+        };
+
+        // Create event channel
+        let (event_tx, mut event_rx) = mpsc::channel::<ExecutionEvent>(100);
+
+        // Create agentic loop with event sender
+        let mut agentic_loop = AgenticLoop::new(config, mock_llm, Some(event_tx)).unwrap();
+
+        // Add initial user message
+        agentic_loop.add_user_message("Test message").unwrap();
+
+        // Run one iteration
+        let task = make_test_task("test-task-1");
+        let result = agentic_loop.iterate(&task).await.unwrap();
+
+        // Should continue (no tool calls, no TASK_COMPLETE)
+        assert!(matches!(result, IterationResult::Continue));
+
+        // Collect events from channel
+        let mut text_deltas = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let ExecutionEvent::TextDelta { content } = event {
+                text_deltas.push(content);
+            }
+        }
+
+        // Should have received text delta(s) containing the response
+        let all_text: String = text_deltas.concat();
+        assert!(
+            all_text.contains("Hello from streaming test!"),
+            "Expected text deltas to contain response, got: {}",
+            all_text
+        );
+    }
+
+    #[tokio::test]
+    async fn test_iterate_without_streaming_works() {
+        // Create a mock LLM
+        let mock_llm = MockLlmClient::new(vec![LlmResponse {
+            content: "Non-streaming response".to_string(),
+            tool_calls: vec![],
+            stop_reason: Some("end_turn".to_string()),
+            tokens_used: 30,
+            cost: 0.0005,
+        }]);
+
+        let temp_dir = TempDir::new().unwrap();
+        let conv_path = temp_dir.path().join("test_conv2.json");
+
+        let config = AgenticConfig {
+            max_iterations: 10,
+            max_tokens: 10000,
+            max_cost: 1.0,
+            model: "test-model".to_string(),
+            working_dir: temp_dir.path().to_path_buf(),
+            conversation_path: conv_path,
+        };
+
+        // Create agentic loop WITHOUT event sender (None)
+        let mut agentic_loop = AgenticLoop::new(config, mock_llm, None).unwrap();
+        agentic_loop.add_user_message("Test").unwrap();
+
+        // Should work without streaming
+        let task = make_test_task("test-task-2");
+        let result = agentic_loop.iterate(&task).await.unwrap();
+        assert!(matches!(result, IterationResult::Continue));
+
+        // Verify tokens and cost were tracked
+        assert_eq!(agentic_loop.tokens_used(), 30);
+        assert!((agentic_loop.cost() - 0.0005).abs() < 0.0001);
+    }
+
+    #[tokio::test]
+    async fn test_conversation_history_preserved_after_streaming() {
+        let mock_llm = MockLlmClient::new(vec![LlmResponse {
+            content: "Response to be saved".to_string(),
+            tool_calls: vec![],
+            stop_reason: Some("end_turn".to_string()),
+            tokens_used: 20,
+            cost: 0.0003,
+        }]);
+
+        let temp_dir = TempDir::new().unwrap();
+        let conv_path = temp_dir.path().join("test_conv3.json");
+
+        let config = AgenticConfig {
+            max_iterations: 10,
+            max_tokens: 10000,
+            max_cost: 1.0,
+            model: "test-model".to_string(),
+            working_dir: temp_dir.path().to_path_buf(),
+            conversation_path: conv_path.clone(),
+        };
+
+        let (event_tx, _event_rx) = mpsc::channel::<ExecutionEvent>(100);
+        let mut agentic_loop = AgenticLoop::new(config.clone(), mock_llm, Some(event_tx)).unwrap();
+        agentic_loop.add_user_message("User input").unwrap();
+
+        let task = make_test_task("test-task-3");
+        let _ = agentic_loop.iterate(&task).await.unwrap();
+        agentic_loop.save().unwrap();
+
+        // Load conversation and verify it contains the assistant response
+        let loaded_conv = Conversation::load(&conv_path).unwrap();
+        let messages: Vec<_> = loaded_conv.messages().collect();
+
+        // Should have user message and assistant response
+        assert!(messages.len() >= 2);
+
+        // Find assistant message
+        let assistant_msg = messages
+            .iter()
+            .find(|m| m.role == MessageRole::Assistant)
+            .expect("Should have assistant message");
+        assert_eq!(assistant_msg.content, "Response to be saved");
     }
 }
