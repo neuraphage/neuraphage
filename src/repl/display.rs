@@ -15,9 +15,7 @@ use std::time::{Duration, Instant};
 use crossterm::cursor::{MoveToColumn, MoveToRow};
 use crossterm::execute;
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
-use crossterm::terminal::{
-    self, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
 
 use crate::error::Result;
 
@@ -393,12 +391,7 @@ impl ReplDisplay {
         write!(out, "\x1b[2K")?;
 
         // Set color and print
-        execute!(
-            out,
-            SetForegroundColor(color),
-            Print(&display_text),
-            ResetColor,
-        )?;
+        execute!(out, SetForegroundColor(color), Print(&display_text), ResetColor,)?;
 
         // Restore cursor position (using CSI u)
         write!(out, "\x1b[u")?;

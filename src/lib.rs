@@ -11,7 +11,6 @@ pub mod error;
 pub mod executor;
 pub mod personas;
 pub mod repl;
-pub mod repl_display;
 pub mod safety;
 pub mod sandbox;
 pub mod task;
@@ -47,8 +46,7 @@ pub use personas::{TaskSnapshot, WatchResult, Watcher, WatcherConfig, WatcherRec
 pub use executor::{ExecutionEvent, ExecutionResult, ExecutionStatus, ExecutorConfig, TaskExecutor};
 
 // Re-export REPL types
-pub use repl::{Repl, ReplInput, Session};
-pub use repl_display::{Activity, ReplDisplay, ReplScreen, StatusState};
+pub use repl::{Activity, Repl, ReplDisplay, ReplInput, ReplScreen, Session, StatusState};
 
 // Re-export safety types
 pub use safety::{SafetyCheckResult, SafetyChecker, SafetyConfig};

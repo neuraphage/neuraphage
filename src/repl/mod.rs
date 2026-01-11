@@ -2,6 +2,8 @@
 //!
 //! Enables persistent conversation sessions with the agent.
 
+pub mod display;
+
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -13,8 +15,10 @@ use uuid::Uuid;
 
 use crate::daemon::{DaemonClient, DaemonRequest, DaemonResponse, ExecutionEventDto, ExecutionStatusDto};
 use crate::error::Result;
-use crate::repl_display::{Activity, ReplDisplay, ReplScreen, StatusState};
 use crate::task::TaskId;
+
+// Re-export display types for use within this module and externally
+pub use display::{Activity, ReplDisplay, ReplScreen, StatusState};
 
 /// A persistent session for REPL mode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
