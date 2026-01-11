@@ -46,6 +46,10 @@ pub enum Error {
     /// Task validation error
     #[error("validation error: {0}")]
     Validation(String),
+
+    /// API/LLM error
+    #[error("api error: {0}")]
+    Api(String),
 }
 
 impl From<eyre::Report> for Error {

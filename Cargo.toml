@@ -46,6 +46,7 @@ humantime = "2"
 # ID generation
 uuid = { version = "1", features = ["v7", "serde"] }
 fork = "0.6.0"
+reqwest = { version = "0.13.1", features = ["json"] }
 
 [build-dependencies]
 

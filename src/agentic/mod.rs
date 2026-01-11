@@ -8,6 +8,7 @@
 //! 5. User Input Handling - Handle user messages
 //! 6. Task Termination - Complete or fail the task
 
+pub mod anthropic;
 pub mod conversation;
 pub mod llm;
 pub mod tools;
@@ -17,6 +18,7 @@ use std::path::PathBuf;
 use crate::error::Result;
 use crate::task::Task;
 
+pub use anthropic::AnthropicClient;
 pub use conversation::{Conversation, Message, MessageRole};
 pub use llm::{LlmClient, LlmConfig, LlmResponse};
 pub use tools::{Tool, ToolCall, ToolExecutor, ToolResult};
