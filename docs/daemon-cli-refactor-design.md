@@ -35,10 +35,9 @@ np list ...
 
 **After (proposed clean structure):**
 ```
-np daemon start [-f]    # Start daemon
-np daemon stop          # Stop daemon
-np daemon status        # Check daemon (renamed from ping)
-np daemon restart [-f]  # Restart daemon (new)
+np daemon start [-f] [-r]  # Start daemon (-r to restart if running)
+np daemon stop             # Stop daemon
+np daemon status           # Check daemon (renamed from ping)
 np new ...
 np list ...
 ```
@@ -67,11 +66,12 @@ Move `Stop` and `Ping` commands under the `Daemon` subcommand using clap's neste
 #### Option A: Nested Subcommands (Recommended)
 
 ```
-np daemon start [-f|--foreground]  # Start daemon
-np daemon stop                     # Stop daemon
-np daemon status                   # Check if daemon is running (renamed from ping)
-np daemon restart                  # Convenience: stop + start
+np daemon start [-f|--foreground] [-r|--restart]  # Start daemon
+np daemon stop                                     # Stop daemon
+np daemon status                                   # Check if daemon is running (renamed from ping)
 ```
+
+The `-r|--restart` flag on `start` handles restart: if daemon is running, stop it first, then start.
 
 This approach uses clap's subcommand nesting:
 
@@ -92,6 +92,10 @@ pub enum DaemonCommand {
         /// Run in foreground (don't daemonize)
         #[arg(short, long)]
         foreground: bool,
+
+        /// Restart: stop daemon first if already running
+        #[arg(short, long)]
+        restart: bool,
     },
 
     /// Stop the daemon
@@ -99,13 +103,6 @@ pub enum DaemonCommand {
 
     /// Check daemon status
     Status,
-
-    /// Restart the daemon
-    Restart {
-        /// Run in foreground after restart
-        #[arg(short, long)]
-        foreground: bool,
-    },
 }
 ```
 
@@ -289,32 +286,24 @@ fn main() -> Result<()> {
 
     // CRITICAL: Background daemon start must happen before tokio runtime
     // The tokio runtime cannot survive a fork
-    if let Some(Command::Daemon(DaemonCommand::Start { foreground: false })) = &cli.command {
+    if let Some(Command::Daemon(DaemonCommand::Start { foreground: false, restart })) = &cli.command {
         let config = Config::load(cli.config.as_ref())?;
         let daemon_config = config.to_daemon_config();
 
         if is_daemon_running(&daemon_config) {
-            eprintln!("{} Daemon is already running", "!".yellow());
-            return Ok(());
-        }
-        return daemonize(&daemon_config);
-    }
-
-    // CRITICAL: Background restart also needs pre-tokio handling
-    if let Some(Command::Daemon(DaemonCommand::Restart { foreground: false })) = &cli.command {
-        let config = Config::load(cli.config.as_ref())?;
-        let daemon_config = config.to_daemon_config();
-
-        // Stop synchronously if running (brief connection)
-        if is_daemon_running(&daemon_config) {
-            // Use a mini runtime just for the stop request
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(async {
-                if let Ok(mut client) = DaemonClient::connect(&daemon_config).await {
-                    client.request(DaemonRequest::Shutdown).await.ok();
-                }
-            });
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            if *restart {
+                // Stop the running daemon first
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(async {
+                    if let Ok(mut client) = DaemonClient::connect(&daemon_config).await {
+                        client.request(DaemonRequest::Shutdown).await.ok();
+                    }
+                });
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            } else {
+                eprintln!("{} Daemon is already running (use -r to restart)", "!".yellow());
+                return Ok(());
+            }
         }
         return daemonize(&daemon_config);
     }
@@ -338,22 +327,29 @@ async fn async_main(cli: Cli) -> Result<()> {
 }
 
 /// Handle daemon commands that can run within tokio runtime
-/// (foreground start, stop, status, foreground restart)
+/// (foreground start, stop, status)
 async fn handle_daemon_command(config: &Config, cmd: DaemonCommand) -> Result<()> {
     let daemon_config = config.to_daemon_config();
 
     match cmd {
-        DaemonCommand::Start { foreground: true } => {
+        DaemonCommand::Start { foreground: true, restart } => {
             // Foreground mode - runs in current process
             if is_daemon_running(&daemon_config) {
-                eprintln!("{} Daemon is already running", "!".yellow());
-                return Ok(());
+                if restart {
+                    // Stop the running daemon first
+                    let mut client = DaemonClient::connect(&daemon_config).await?;
+                    client.request(DaemonRequest::Shutdown).await?;
+                    wait_for_daemon_stop(&daemon_config).await;
+                } else {
+                    eprintln!("{} Daemon is already running (use -r to restart)", "!".yellow());
+                    return Ok(());
+                }
             }
             println!("{} Starting daemon in foreground...", "->".blue());
             let daemon = Daemon::new(daemon_config)?;
             daemon.run().await?;
         }
-        DaemonCommand::Start { foreground: false } => {
+        DaemonCommand::Start { foreground: false, .. } => {
             // Should not reach here - handled in main() before tokio
             unreachable!("Background daemon start handled before tokio runtime");
         }
@@ -382,23 +378,6 @@ async fn handle_daemon_command(config: &Config, cmd: DaemonCommand) -> Result<()
                 println!("{} Daemon is not running", "x".red());
             }
         }
-        DaemonCommand::Restart { foreground: true } => {
-            // Stop if running
-            if is_daemon_running(&daemon_config) {
-                let mut client = DaemonClient::connect(&daemon_config).await?;
-                client.request(DaemonRequest::Shutdown).await?;
-                // Wait for daemon to fully stop
-                wait_for_daemon_stop(&daemon_config).await;
-            }
-            // Start in foreground
-            println!("{} Starting daemon in foreground...", "->".blue());
-            let daemon = Daemon::new(daemon_config)?;
-            daemon.run().await?;
-        }
-        DaemonCommand::Restart { foreground: false } => {
-            // Should not reach here - handled in main() before tokio
-            unreachable!("Background daemon restart handled before tokio runtime");
-        }
     }
     Ok(())
 }
@@ -424,15 +403,24 @@ async fn wait_for_daemon_stop(daemon_config: &DaemonConfig) {
    ```rust
    #[derive(Subcommand)]
    pub enum DaemonCommand {
-       Start { #[arg(short, long)] foreground: bool },
+       /// Start the daemon
+       Start {
+           /// Run in foreground (don't daemonize)
+           #[arg(short, long)]
+           foreground: bool,
+           /// Restart: stop daemon first if already running
+           #[arg(short, long)]
+           restart: bool,
+       },
+       /// Stop the daemon
        Stop,
+       /// Check daemon status
        Status,
-       Restart { #[arg(short, long)] foreground: bool },
    }
    ```
 
 2. Modify `Command` enum:
-   - Change `Daemon { foreground: bool }` to `Daemon(DaemonCommand)`
+   - Change `Daemon { foreground: bool }` to `#[command(subcommand)] Daemon(DaemonCommand)`
    - Remove `Stop` variant
    - Remove `Ping` variant
 
@@ -440,17 +428,15 @@ async fn wait_for_daemon_stop(daemon_config: &DaemonConfig) {
 
 **File:** `src/main.rs`
 
-1. Update `main()` to check for `Command::Daemon(DaemonCommand::Start { foreground: false })` and `Command::Daemon(DaemonCommand::Restart { foreground: false })`
+1. Update `main()` to check for `Command::Daemon(DaemonCommand::Start { foreground: false, restart })` and handle restart flag
 
 2. Update `async_main()` to route `Command::Daemon(cmd)` to new `handle_daemon_command()`
 
 3. Add `handle_daemon_command()` function with match arms for:
-   - `DaemonCommand::Start { foreground: true }` - foreground mode
-   - `DaemonCommand::Start { foreground: false }` - unreachable
+   - `DaemonCommand::Start { foreground: true, restart }` - foreground mode with optional restart
+   - `DaemonCommand::Start { foreground: false, .. }` - unreachable (handled pre-tokio)
    - `DaemonCommand::Stop` - shutdown request
    - `DaemonCommand::Status` - ping/status check
-   - `DaemonCommand::Restart { foreground: true }` - stop + start foreground
-   - `DaemonCommand::Restart { foreground: false }` - unreachable
 
 4. Add `wait_for_daemon_stop()` helper function
 
@@ -497,7 +483,19 @@ Commands:
   start    Start the daemon
   stop     Stop the daemon
   status   Check daemon status
-  restart  Restart the daemon
+```
+
+And `np daemon start --help` will show:
+
+```
+Start the daemon
+
+Usage: np daemon start [OPTIONS]
+
+Options:
+  -f, --foreground  Run in foreground (don't daemonize)
+  -r, --restart     Restart: stop daemon first if already running
+  -h, --help        Print help
 ```
 
 ### Migration Strategy
@@ -638,10 +636,9 @@ The nested subcommand pattern makes it easy to add more daemon operations:
 ```rust
 #[derive(Subcommand)]
 pub enum DaemonCommand {
-    Start { foreground: bool },
+    Start { foreground: bool, restart: bool },
     Stop,
     Status,
-    Restart { foreground: bool },
 
     // Future additions:
     /// View daemon logs
@@ -712,7 +709,6 @@ Commands:
   start    Start the daemon
   stop     Stop the daemon
   status   Check daemon status
-  restart  Restart the daemon
 
 For more information, try '--help'.
 ```
@@ -761,19 +757,19 @@ DaemonCommand::Status => {
 }
 ```
 
-### Restart fails to stop daemon
+### `start -r` fails to stop daemon
 
-If the daemon doesn't stop within the timeout, restart should fail gracefully:
+If the daemon doesn't stop within the timeout when using `--restart`, start should fail gracefully:
 
 ```rust
-// In background restart handling (pre-tokio)
-if is_daemon_running(&daemon_config) {
+// In background start with restart flag (pre-tokio)
+if is_daemon_running(&daemon_config) && restart {
     // ... send shutdown ...
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     // Check if it actually stopped
     if is_daemon_running(&daemon_config) {
-        eprintln!("{} Daemon did not stop in time, aborting restart", "!".red());
+        eprintln!("{} Daemon did not stop in time, aborting", "!".red());
         return Ok(());
     }
 }
@@ -794,7 +790,7 @@ Socket creation may fail if the directory doesn't exist or isn't writable. The d
 | Users have scripts using `np stop` | Medium | Low | Add deprecation warning pointing to `np daemon stop` |
 | Tab completion breaks | Low | Low | Regenerate shell completions |
 | Help text becomes unclear | Low | Medium | Carefully craft help strings for nested structure |
-| Restart hangs on unresponsive daemon | Low | Medium | Add timeout and clear error message |
+| `start -r` hangs on unresponsive daemon | Low | Medium | Add timeout and clear error message |
 | Stale socket confuses users | Low | Low | `status` command reports stale sockets explicitly |
 
 ## Open Questions
@@ -808,14 +804,21 @@ Socket creation may fail if the directory doesn't exist or isn't writable. The d
 
 | File | Change |
 |------|--------|
-| `src/cli.rs` | Add `DaemonCommand` enum, modify `Command::Daemon` to use it, remove `Stop` and `Ping` |
+| `src/cli.rs` | Add `DaemonCommand` enum (Start with -f/-r flags, Stop, Status), remove top-level `Stop` and `Ping` |
 | `src/main.rs` | Update pre-tokio checks, add `handle_daemon_command()`, update routing |
 
+**New CLI structure:**
+```
+np daemon start [-f] [-r]  # Start daemon (-r restarts if running)
+np daemon stop             # Stop daemon
+np daemon status           # Check daemon status
+```
+
 **Lines of code estimate:**
-- ~30 lines added to cli.rs (DaemonCommand enum + doc comments)
-- ~80 lines added to main.rs (handle_daemon_command function)
+- ~25 lines added to cli.rs (DaemonCommand enum + doc comments)
+- ~60 lines added to main.rs (handle_daemon_command function)
 - ~20 lines removed from main.rs (old Stop/Ping handling)
-- Net: ~90 lines added
+- Net: ~65 lines added
 
 ## Review Process Summary
 

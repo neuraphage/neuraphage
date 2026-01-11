@@ -1,19 +1,14 @@
-//! REPL display module for inline terminal rendering.
+//! REPL display module for terminal output.
 //!
-//! Provides a status bar at the bottom of the terminal while streaming
-//! content scrolls above it, similar to Claude Code's terminal UX.
+//! Provides streaming text output with a final status summary.
+//! Handles raw mode for proper terminal control.
 
-use std::io::{IsTerminal, Stdout, Write, stdout};
+use std::io::{IsTerminal, Write, stdout};
 use std::panic;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use ratatui::backend::CrosstermBackend;
-use ratatui::prelude::Widget;
-use ratatui::style::{Color, Style};
-use ratatui::widgets::Paragraph;
-use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::error::Result;
 
@@ -65,13 +60,13 @@ impl Activity {
     }
 
     /// Get the color for this activity.
-    pub fn color(&self) -> Color {
+    pub fn color(&self) -> &'static str {
         match self {
-            Activity::Idle => Color::Gray,
-            Activity::Thinking => Color::Blue,
-            Activity::Streaming => Color::Green,
-            Activity::ExecutingTool(_) => Color::Yellow,
-            Activity::WaitingForUser => Color::Yellow,
+            Activity::Idle => "\x1b[90m",             // Gray
+            Activity::Thinking => "\x1b[34m",         // Blue
+            Activity::Streaming => "\x1b[32m",        // Green
+            Activity::ExecutingTool(_) => "\x1b[33m", // Yellow
+            Activity::WaitingForUser => "\x1b[33m",   // Yellow
         }
     }
 
@@ -129,179 +124,106 @@ fn format_number(n: u64) -> String {
     result
 }
 
-/// Display mode - either inline (TTY) or fallback (non-TTY).
-enum DisplayMode {
-    /// Inline viewport mode with ratatui.
-    Inline {
-        terminal: Terminal<CrosstermBackend<Stdout>>,
-    },
-    /// Fallback mode for non-TTY environments.
-    Fallback,
-}
-
-/// REPL display with inline viewport for status bar.
+/// REPL display for terminal output.
 pub struct ReplDisplay {
-    mode: DisplayMode,
     status: StatusState,
     /// Track if we're in raw mode (for cleanup).
     raw_mode_enabled: bool,
     /// Animation frame counter for spinner.
     frame: usize,
+    /// Whether stdout is a TTY.
+    is_tty: bool,
 }
 
 impl ReplDisplay {
     /// Create a new display.
-    ///
-    /// If stdout is a TTY, uses inline viewport mode.
-    /// Otherwise, falls back to simple printing.
     pub fn new() -> Result<Self> {
-        if stdout().is_terminal() {
+        let is_tty = stdout().is_terminal();
+
+        if is_tty {
             // Install panic hook to restore terminal on panic
             install_panic_hook();
 
             // Enable raw mode for terminal control
             enable_raw_mode()?;
             RAW_MODE_ACTIVE.store(true, Ordering::SeqCst);
-
-            // Create terminal with inline viewport (1 line for status)
-            let backend = CrosstermBackend::new(stdout());
-            let terminal = Terminal::with_options(
-                backend,
-                TerminalOptions {
-                    viewport: Viewport::Inline(1),
-                },
-            )?;
-
-            Ok(Self {
-                mode: DisplayMode::Inline { terminal },
-                status: StatusState {
-                    task_started: Some(Instant::now()),
-                    ..Default::default()
-                },
-                raw_mode_enabled: true,
-                frame: 0,
-            })
-        } else {
-            Ok(Self {
-                mode: DisplayMode::Fallback,
-                status: StatusState {
-                    task_started: Some(Instant::now()),
-                    ..Default::default()
-                },
-                raw_mode_enabled: false,
-                frame: 0,
-            })
         }
+
+        Ok(Self {
+            status: StatusState {
+                task_started: Some(Instant::now()),
+                ..Default::default()
+            },
+            raw_mode_enabled: is_tty,
+            frame: 0,
+            is_tty,
+        })
     }
 
-    /// Check if we're in inline (TTY) mode.
+    /// Check if we're in TTY mode.
     pub fn is_inline(&self) -> bool {
-        matches!(self.mode, DisplayMode::Inline { .. })
+        self.is_tty
     }
 
-    /// Print streaming content (scrolls above status bar).
+    /// Print streaming content.
     pub fn print_content(&mut self, text: &str) -> Result<()> {
-        match &mut self.mode {
-            DisplayMode::Inline { terminal } => {
-                // Use insert_before to print above the inline viewport
-                terminal.insert_before(1, |buf| {
-                    // Just render the text - it will scroll naturally
-                    let para = Paragraph::new(text);
-                    para.render(buf.area, buf);
-                })?;
-            }
-            DisplayMode::Fallback => {
-                print!("{}", text);
-                stdout().flush()?;
-            }
+        if self.raw_mode_enabled {
+            // In raw mode, \n doesn't include carriage return
+            print!("{}", text.replace('\n', "\r\n"));
+        } else {
+            print!("{}", text);
         }
+        stdout().flush()?;
         Ok(())
     }
 
-    /// Print a complete line (e.g., tool output).
+    /// Print a complete line.
     pub fn println(&mut self, line: &str) -> Result<()> {
-        match &mut self.mode {
-            DisplayMode::Inline { terminal } => {
-                terminal.insert_before(1, |buf| {
-                    let para = Paragraph::new(format!("{}\n", line));
-                    para.render(buf.area, buf);
-                })?;
-            }
-            DisplayMode::Fallback => {
-                println!("{}", line);
-            }
+        if self.raw_mode_enabled {
+            print!("{}\r\n", line);
+        } else {
+            println!("{}", line);
         }
+        stdout().flush()?;
         Ok(())
     }
 
-    /// Update the status bar.
+    /// Update the status (just tracks state, doesn't print during streaming).
     pub fn update_status(&mut self, status: StatusState) -> Result<()> {
         self.status = status;
-        // Advance spinner frame for animation
         self.frame = self.frame.wrapping_add(1);
-
-        // Pre-compute values before borrowing terminal
-        let color = self.status.activity.color();
-        // Use a reasonable default width, will be overwritten in draw
-        let status_text = self.format_status_line(120);
-
-        match &mut self.mode {
-            DisplayMode::Inline { terminal } => {
-                terminal.draw(|frame| {
-                    let area = frame.area();
-                    // Truncate to actual width if needed
-                    let display_text = if status_text.len() > area.width as usize {
-                        format!("{}...", &status_text[..area.width.saturating_sub(3) as usize])
-                    } else {
-                        status_text.clone()
-                    };
-                    let para = Paragraph::new(display_text).style(Style::default().fg(color));
-                    frame.render_widget(para, area);
-                })?;
-            }
-            DisplayMode::Fallback => {
-                // In fallback mode, don't print status during streaming
-                // It will be shown at the end via print_summary()
-            }
-        }
+        // Don't print status during streaming - it causes flicker
+        // Status will be shown in print_summary()
         Ok(())
     }
 
-    /// Format the status line to fit within the given width.
-    fn format_status_line(&self, max_width: usize) -> String {
-        let icon = self.status.activity.icon(self.frame);
-        let activity = self.status.activity.text();
-        let elapsed = format_duration(self.status.elapsed());
-        let tokens = format_number(self.status.tokens_used);
-
-        let status = format!(
-            "{} {} │ Iter {} │ {} tokens │ ${:.4} │ {}",
-            icon, activity, self.status.iteration, tokens, self.status.cost, elapsed
-        );
-
-        // Truncate if too long
-        if status.len() > max_width {
-            format!("{}...", &status[..max_width.saturating_sub(3)])
-        } else {
-            status
-        }
-    }
-
-    /// Print final summary (for fallback mode or at end).
+    /// Print final summary.
     pub fn print_summary(&self) -> Result<()> {
         let elapsed = format_duration(self.status.elapsed());
         let tokens = format_number(self.status.tokens_used);
 
-        eprintln!(
-            "\n[Completed: {} iterations, {} tokens, ${:.4}, {}]",
-            self.status.iteration, tokens, self.status.cost, elapsed
-        );
+        if self.raw_mode_enabled {
+            // Already exited raw mode at this point via cleanup()
+            eprintln!(
+                "\r\n[Completed: {} iterations, {} tokens, ${:.4}, {}]",
+                self.status.iteration, tokens, self.status.cost, elapsed
+            );
+        } else {
+            eprintln!(
+                "\n[Completed: {} iterations, {} tokens, ${:.4}, {}]",
+                self.status.iteration, tokens, self.status.cost, elapsed
+            );
+        }
         Ok(())
     }
 
     /// Cleanup and restore terminal state.
     pub fn cleanup(&mut self) -> Result<()> {
         if self.raw_mode_enabled {
+            // Print a newline to ensure we're on a fresh line
+            print!("\r\n");
+            stdout().flush()?;
+
             disable_raw_mode()?;
             self.raw_mode_enabled = false;
             RAW_MODE_ACTIVE.store(false, Ordering::SeqCst);
