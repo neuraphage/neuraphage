@@ -123,4 +123,44 @@ pub enum Command {
 
     /// Check daemon status
     Ping,
+
+    /// Run a task interactively (create, start, and attach)
+    Run {
+        /// Task description
+        description: String,
+
+        /// Working directory
+        #[arg(short = 'd', long)]
+        dir: Option<PathBuf>,
+
+        /// Priority (0=critical, 4=low)
+        #[arg(short, long, default_value = "2")]
+        priority: u8,
+
+        /// Tags for the task
+        #[arg(short, long)]
+        tags: Vec<String>,
+
+        /// Extended context
+        #[arg(short, long)]
+        context: Option<String>,
+    },
+
+    /// Attach to a running task
+    Attach {
+        /// Task ID
+        id: String,
+    },
+
+    /// Start a task
+    Start {
+        /// Task ID
+        id: String,
+    },
+
+    /// Cancel a running task
+    Cancel {
+        /// Task ID
+        id: String,
+    },
 }

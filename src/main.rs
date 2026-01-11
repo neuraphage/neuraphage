@@ -13,7 +13,9 @@ mod cli;
 
 use cli::{Cli, Command};
 use neuraphage::config::Config;
-use neuraphage::daemon::{Daemon, DaemonClient, DaemonRequest, DaemonResponse, is_daemon_running};
+use neuraphage::daemon::{
+    Daemon, DaemonClient, DaemonRequest, DaemonResponse, ExecutionEventDto, ExecutionStatusDto, is_daemon_running,
+};
 
 fn setup_logging() -> Result<()> {
     let log_dir = dirs::data_local_dir()
@@ -267,9 +269,277 @@ async fn run_client_command(config: &Config, command: Command) -> Result<()> {
                 _ => {}
             }
         }
+
+        Command::Run {
+            description,
+            dir: _,
+            priority,
+            tags,
+            context,
+        } => {
+            // Create the task
+            let request = DaemonRequest::CreateTask {
+                description: description.clone(),
+                priority,
+                tags,
+                context,
+            };
+            let response = client.request(request).await?;
+
+            let task_id = match response {
+                DaemonResponse::Task(Some(task)) => {
+                    println!("{} Created task: {}", "✓".green(), task.id.0.cyan());
+                    task.id.0.clone()
+                }
+                DaemonResponse::Error { message } => {
+                    eprintln!("{} Failed to create task: {}", "✗".red(), message);
+                    return Ok(());
+                }
+                _ => {
+                    eprintln!("{} Unexpected response", "✗".red());
+                    return Ok(());
+                }
+            };
+
+            // Start the task
+            let request = DaemonRequest::StartTask { id: task_id.clone() };
+            let response = client.request(request).await?;
+
+            match response {
+                DaemonResponse::TaskStarted { task_id: _ } => {
+                    println!("{} Task started", "→".blue());
+                }
+                DaemonResponse::Error { message } => {
+                    eprintln!("{} Failed to start task: {}", "✗".red(), message);
+                    return Ok(());
+                }
+                _ => {}
+            }
+
+            // Attach to the task
+            run_interactive_loop(&mut client, &task_id).await?;
+        }
+
+        Command::Attach { id } => {
+            run_interactive_loop(&mut client, &id).await?;
+        }
+
+        Command::Start { id } => {
+            let request = DaemonRequest::StartTask { id: id.clone() };
+            let response = client.request(request).await?;
+            match response {
+                DaemonResponse::TaskStarted { task_id } => {
+                    println!("{} Started task: {}", "✓".green(), task_id.cyan());
+                }
+                DaemonResponse::Error { message } => eprintln!("{} {}", "✗".red(), message),
+                _ => {}
+            }
+        }
+
+        Command::Cancel { id } => {
+            let request = DaemonRequest::CancelTask { id };
+            let response = client.request(request).await?;
+            match response {
+                DaemonResponse::Ok { message } => {
+                    println!(
+                        "{} {}",
+                        "✓".green(),
+                        message.unwrap_or_else(|| "Task cancelled".to_string())
+                    );
+                }
+                DaemonResponse::Error { message } => eprintln!("{} {}", "✗".red(), message),
+                _ => {}
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Run the interactive loop for a task.
+async fn run_interactive_loop(client: &mut DaemonClient, task_id: &str) -> Result<()> {
+    use std::io::{BufRead, stdin};
+
+    println!(
+        "{} Attached to task {}. Press Ctrl+C to detach.",
+        "→".blue(),
+        task_id.cyan()
+    );
+    println!();
+
+    // Set up Ctrl+C handler
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        r.store(false, std::sync::atomic::Ordering::SeqCst);
+    })
+    .ok();
+
+    loop {
+        if !running.load(std::sync::atomic::Ordering::SeqCst) {
+            println!();
+            println!("{} Detached from task", "○".yellow());
+            break;
+        }
+
+        // Poll for updates
+        let request = DaemonRequest::AttachTask {
+            id: task_id.to_string(),
+        };
+        let response = client.request(request).await?;
+
+        match response {
+            DaemonResponse::ExecutionUpdate { event, .. } => {
+                handle_execution_event(&event);
+
+                // Check if task completed or failed
+                match event {
+                    ExecutionEventDto::Completed { .. } | ExecutionEventDto::Failed { .. } => {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            DaemonResponse::ExecutionStatusResponse { status, .. } => {
+                match &status {
+                    ExecutionStatusDto::WaitingForUser { prompt } => {
+                        // Display prompt and get user input
+                        println!();
+                        println!("{} {}", "?".yellow(), prompt);
+                        print!("{} ", ">".cyan());
+                        std::io::stdout().flush().ok();
+
+                        // Read user input
+                        let stdin = stdin();
+                        let mut input = String::new();
+                        if stdin.lock().read_line(&mut input).is_ok() {
+                            let input = input.trim().to_string();
+                            if !input.is_empty() {
+                                let request = DaemonRequest::ProvideInput {
+                                    id: task_id.to_string(),
+                                    input,
+                                };
+                                client.request(request).await?;
+                            }
+                        }
+                    }
+                    ExecutionStatusDto::Completed { reason } => {
+                        println!();
+                        println!("{} Task completed: {}", "✓".green(), reason);
+                        break;
+                    }
+                    ExecutionStatusDto::Failed { error } => {
+                        println!();
+                        println!("{} Task failed: {}", "✗".red(), error);
+                        break;
+                    }
+                    ExecutionStatusDto::Cancelled => {
+                        println!();
+                        println!("{} Task was cancelled", "⊘".yellow());
+                        break;
+                    }
+                    ExecutionStatusDto::NotRunning => {
+                        println!("{} Task is not running", "○".yellow());
+                        break;
+                    }
+                    ExecutionStatusDto::Running {
+                        iteration,
+                        tokens_used,
+                        cost,
+                    } => {
+                        // Show status line
+                        print!(
+                            "\r{} Iteration {} | Tokens: {} | Cost: ${:.4}   ",
+                            "●".green(),
+                            iteration,
+                            tokens_used,
+                            cost
+                        );
+                        std::io::stdout().flush().ok();
+                    }
+                }
+            }
+            DaemonResponse::WaitingForInput { prompt, .. } => {
+                // Display prompt and get user input
+                println!();
+                println!("{} {}", "?".yellow(), prompt);
+                print!("{} ", ">".cyan());
+                std::io::stdout().flush().ok();
+
+                // Read user input
+                let stdin = stdin();
+                let mut input = String::new();
+                if stdin.lock().read_line(&mut input).is_ok() {
+                    let input = input.trim().to_string();
+                    if !input.is_empty() {
+                        let request = DaemonRequest::ProvideInput {
+                            id: task_id.to_string(),
+                            input,
+                        };
+                        client.request(request).await?;
+                    }
+                }
+            }
+            DaemonResponse::Error { message } => {
+                eprintln!("{} {}", "✗".red(), message);
+                break;
+            }
+            _ => {}
+        }
+
+        // Small delay to avoid spinning
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+
+    Ok(())
+}
+
+/// Handle an execution event and print appropriate output.
+fn handle_execution_event(event: &ExecutionEventDto) {
+    match event {
+        ExecutionEventDto::IterationComplete {
+            iteration,
+            tokens_used,
+            cost,
+        } => {
+            // Update status line
+            print!(
+                "\r{} Iteration {} | Tokens: {} | Cost: ${:.4}   ",
+                "●".green(),
+                iteration,
+                tokens_used,
+                cost
+            );
+            std::io::stdout().flush().ok();
+        }
+        ExecutionEventDto::ToolCalled { name, result } => {
+            println!();
+            println!("{} Tool: {}", "→".blue(), name.cyan());
+            // Truncate result if too long
+            let display_result = if result.len() > 200 {
+                format!("{}...", &result[..200])
+            } else {
+                result.clone()
+            };
+            println!("  {}", display_result.dimmed());
+        }
+        ExecutionEventDto::LlmResponse { content } => {
+            println!();
+            println!("{}", content);
+        }
+        ExecutionEventDto::WaitingForUser { prompt } => {
+            println!();
+            println!("{} {}", "?".yellow(), prompt);
+        }
+        ExecutionEventDto::Completed { reason } => {
+            println!();
+            println!("{} Task completed: {}", "✓".green(), reason);
+        }
+        ExecutionEventDto::Failed { error } => {
+            println!();
+            println!("{} Task failed: {}", "✗".red(), error);
+        }
+    }
 }
 
 async fn show_status(config: &Config) -> Result<()> {
