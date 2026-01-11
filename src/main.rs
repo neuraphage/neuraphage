@@ -376,6 +376,7 @@ async fn run_interactive_loop(client: &mut DaemonClient, task_id: &str) -> Resul
     })
     .ok();
 
+    let mut mid_line = false; // Track if we're in the middle of streaming output
     loop {
         if !running.load(std::sync::atomic::Ordering::SeqCst) {
             println!();
@@ -391,7 +392,7 @@ async fn run_interactive_loop(client: &mut DaemonClient, task_id: &str) -> Resul
 
         match response {
             DaemonResponse::ExecutionUpdate { event, .. } => {
-                handle_execution_event(&event);
+                handle_execution_event(&event, &mut mid_line);
 
                 // Check if task completed or failed
                 match event {
@@ -496,13 +497,17 @@ async fn run_interactive_loop(client: &mut DaemonClient, task_id: &str) -> Resul
 }
 
 /// Handle an execution event and print appropriate output.
-fn handle_execution_event(event: &ExecutionEventDto) {
+fn handle_execution_event(event: &ExecutionEventDto, mid_line: &mut bool) {
     match event {
         ExecutionEventDto::IterationComplete {
             iteration,
             tokens_used,
             cost,
         } => {
+            if *mid_line {
+                println!();
+                *mid_line = false;
+            }
             // Update status line
             print!(
                 "\r{} Iteration {} | Tokens: {} | Cost: ${:.4}   ",
@@ -514,6 +519,10 @@ fn handle_execution_event(event: &ExecutionEventDto) {
             std::io::stdout().flush().ok();
         }
         ExecutionEventDto::ToolCalled { name, result } => {
+            if *mid_line {
+                println!();
+                *mid_line = false;
+            }
             println!();
             println!("{} Tool: {}", "→".blue(), name.cyan());
             // Truncate result if too long
@@ -525,6 +534,10 @@ fn handle_execution_event(event: &ExecutionEventDto) {
             println!("  {}", display_result.dimmed());
         }
         ExecutionEventDto::LlmResponse { content } => {
+            if *mid_line {
+                println!();
+                *mid_line = false;
+            }
             println!();
             println!("{}", content);
         }
@@ -532,16 +545,27 @@ fn handle_execution_event(event: &ExecutionEventDto) {
             // Print streaming text immediately without newline
             print!("{}", content);
             std::io::stdout().flush().ok();
+            *mid_line = true;
         }
         ExecutionEventDto::WaitingForUser { prompt } => {
+            if *mid_line {
+                println!();
+                *mid_line = false;
+            }
             println!();
             println!("{} {}", "?".yellow(), prompt);
         }
         ExecutionEventDto::Completed { reason } => {
+            if *mid_line {
+                println!();
+            }
             println!();
             println!("{} Task completed: {}", "✓".green(), reason);
         }
         ExecutionEventDto::Failed { error } => {
+            if *mid_line {
+                println!();
+            }
             println!();
             println!("{} Task failed: {}", "✗".red(), error);
         }

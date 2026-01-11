@@ -306,6 +306,7 @@ impl Repl {
 
     async fn wait_for_task(&mut self, task_id: &str) -> Result<()> {
         println!();
+        let mut mid_line = false; // Track if we're in the middle of streaming output
 
         loop {
             let request = DaemonRequest::AttachTask {
@@ -371,24 +372,44 @@ impl Repl {
                     use crate::daemon::ExecutionEventDto;
                     match event {
                         ExecutionEventDto::LlmResponse { content } => {
+                            if mid_line {
+                                println!();
+                                mid_line = false;
+                            }
                             println!();
                             println!("{}", content);
                         }
                         ExecutionEventDto::ToolCalled { name, result } => {
+                            if mid_line {
+                                println!();
+                                mid_line = false;
+                            }
                             println!();
                             println!("{} {}", "→".blue(), name.cyan());
                             let display = if result.len() > 200 { format!("{}...", &result[..200]) } else { result };
                             println!("  {}", display.dimmed());
                         }
                         ExecutionEventDto::Completed { reason } => {
+                            if mid_line {
+                                println!();
+                            }
                             println!();
                             println!("{} {}", "✓".green(), reason);
                             break;
                         }
                         ExecutionEventDto::Failed { error } => {
+                            if mid_line {
+                                println!();
+                            }
                             println!();
                             println!("{} {}", "✗".red(), error);
                             break;
+                        }
+                        ExecutionEventDto::TextDelta { content } => {
+                            // Print streaming text immediately without newline
+                            print!("{}", content);
+                            std::io::stdout().flush().ok();
+                            mid_line = true;
                         }
                         _ => {}
                     }
