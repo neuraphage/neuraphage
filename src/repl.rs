@@ -275,7 +275,7 @@ impl Repl {
         // Create a new task for this message
         let request = DaemonRequest::CreateTask {
             description: message.to_string(),
-            priority: 50,
+            priority: 2,
             tags: vec!["repl".to_string()],
             context: None,
         };
