@@ -9,6 +9,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
 use crate::error::{Error, Result};
+use crate::executor::{ExecutionEvent, ExecutionStatus, ExecutorConfig, TaskExecutor};
 use crate::task::{Task, TaskId, TaskStatus};
 use crate::task_manager::TaskManager;
 
@@ -82,6 +83,16 @@ pub enum DaemonRequest {
     RemoveDependency { blocked_id: String, blocker_id: String },
     /// Get task counts.
     TaskCounts,
+    /// Start executing a task.
+    StartTask { id: String },
+    /// Provide user input to a waiting task.
+    ProvideInput { id: String, input: String },
+    /// Attach to a task to receive execution updates.
+    AttachTask { id: String },
+    /// Get execution status for a task.
+    GetExecutionStatus { id: String },
+    /// Cancel a running task.
+    CancelTask { id: String },
     /// Shutdown daemon.
     Shutdown,
 }
@@ -110,14 +121,109 @@ pub enum DaemonResponse {
     },
     /// Error response.
     Error { message: String },
+    /// Execution update (for attached clients).
+    ExecutionUpdate { task_id: String, event: ExecutionEventDto },
+    /// Task waiting for input.
+    WaitingForInput { task_id: String, prompt: String },
+    /// Execution status response.
+    ExecutionStatusResponse {
+        task_id: String,
+        status: ExecutionStatusDto,
+    },
+    /// Task started executing.
+    TaskStarted { task_id: String },
     /// Shutdown acknowledgment.
     Shutdown,
+}
+
+/// DTO for execution events (serializable version of ExecutionEvent).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ExecutionEventDto {
+    /// Iteration completed.
+    IterationComplete {
+        iteration: u32,
+        tokens_used: u64,
+        cost: f64,
+    },
+    /// Tool was called.
+    ToolCalled { name: String, result: String },
+    /// LLM response received.
+    LlmResponse { content: String },
+    /// Waiting for user input.
+    WaitingForUser { prompt: String },
+    /// Task completed.
+    Completed { reason: String },
+    /// Task failed.
+    Failed { error: String },
+}
+
+impl From<ExecutionEvent> for ExecutionEventDto {
+    fn from(event: ExecutionEvent) -> Self {
+        match event {
+            ExecutionEvent::IterationComplete {
+                iteration,
+                tokens_used,
+                cost,
+            } => ExecutionEventDto::IterationComplete {
+                iteration,
+                tokens_used,
+                cost,
+            },
+            ExecutionEvent::ToolCalled { name, result } => ExecutionEventDto::ToolCalled { name, result },
+            ExecutionEvent::LlmResponse { content } => ExecutionEventDto::LlmResponse { content },
+            ExecutionEvent::WaitingForUser { prompt } => ExecutionEventDto::WaitingForUser { prompt },
+            ExecutionEvent::Completed { reason } => ExecutionEventDto::Completed { reason },
+            ExecutionEvent::Failed { error } => ExecutionEventDto::Failed { error },
+        }
+    }
+}
+
+/// DTO for execution status (serializable version of ExecutionStatus).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ExecutionStatusDto {
+    /// Task is currently running.
+    Running {
+        iteration: u32,
+        tokens_used: u64,
+        cost: f64,
+    },
+    /// Task is waiting for user input.
+    WaitingForUser { prompt: String },
+    /// Task completed successfully.
+    Completed { reason: String },
+    /// Task failed.
+    Failed { error: String },
+    /// Task was cancelled.
+    Cancelled,
+    /// Task is not currently executing.
+    NotRunning,
+}
+
+impl From<&ExecutionStatus> for ExecutionStatusDto {
+    fn from(status: &ExecutionStatus) -> Self {
+        match status {
+            ExecutionStatus::Running {
+                iteration,
+                tokens_used,
+                cost,
+            } => ExecutionStatusDto::Running {
+                iteration: *iteration,
+                tokens_used: *tokens_used,
+                cost: *cost,
+            },
+            ExecutionStatus::WaitingForUser { prompt } => ExecutionStatusDto::WaitingForUser { prompt: prompt.clone() },
+            ExecutionStatus::Completed { reason } => ExecutionStatusDto::Completed { reason: reason.clone() },
+            ExecutionStatus::Failed { error } => ExecutionStatusDto::Failed { error: error.clone() },
+            ExecutionStatus::Cancelled => ExecutionStatusDto::Cancelled,
+        }
+    }
 }
 
 /// The neuraphage daemon.
 pub struct Daemon {
     config: DaemonConfig,
     manager: Arc<Mutex<TaskManager>>,
+    executor: Arc<Mutex<TaskExecutor>>,
     shutdown: tokio::sync::broadcast::Sender<()>,
 }
 
@@ -134,11 +240,19 @@ impl Daemon {
             TaskManager::init(&config.data_path)?
         };
 
+        // Initialize task executor
+        let executor_config = ExecutorConfig {
+            data_dir: config.data_path.clone(),
+            ..Default::default()
+        };
+        let executor = TaskExecutor::new(executor_config)?;
+
         let (shutdown, _) = tokio::sync::broadcast::channel(1);
 
         Ok(Self {
             config,
             manager: Arc::new(Mutex::new(manager)),
+            executor: Arc::new(Mutex::new(executor)),
             shutdown,
         })
     }
@@ -165,9 +279,10 @@ impl Daemon {
                     match accept_result {
                         Ok((stream, _)) => {
                             let manager = Arc::clone(&self.manager);
+                            let executor = Arc::clone(&self.executor);
                             let shutdown_tx = self.shutdown.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection(stream, manager, shutdown_tx).await {
+                                if let Err(e) = handle_connection(stream, manager, executor, shutdown_tx).await {
                                     log::error!("Connection error: {}", e);
                                 }
                             });
@@ -205,6 +320,7 @@ impl Daemon {
 async fn handle_connection(
     stream: UnixStream,
     manager: Arc<Mutex<TaskManager>>,
+    executor: Arc<Mutex<TaskExecutor>>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
@@ -213,7 +329,7 @@ async fn handle_connection(
 
     while reader.read_line(&mut line).await? > 0 {
         let request: DaemonRequest = serde_json::from_str(&line)?;
-        let response = process_request(request, &manager, &shutdown_tx).await;
+        let response = process_request(request, &manager, &executor, &shutdown_tx).await;
 
         let response_json = serde_json::to_string(&response)?;
         writer.write_all(response_json.as_bytes()).await?;
@@ -234,6 +350,7 @@ async fn handle_connection(
 async fn process_request(
     request: DaemonRequest,
     manager: &Arc<Mutex<TaskManager>>,
+    executor: &Arc<Mutex<TaskExecutor>>,
     shutdown_tx: &tokio::sync::broadcast::Sender<()>,
 ) -> DaemonResponse {
     match request {
@@ -350,6 +467,115 @@ async fn process_request(
                     failed: counts.failed,
                     cancelled: counts.cancelled,
                 },
+                Err(e) => DaemonResponse::Error { message: e.to_string() },
+            }
+        }
+
+        DaemonRequest::StartTask { id } => {
+            let task_id = TaskId::from_engram_id(&id);
+
+            // Get the task from the manager
+            let task = {
+                let mgr = manager.lock().await;
+                match mgr.get_task(&task_id) {
+                    Ok(Some(task)) => task,
+                    Ok(None) => {
+                        return DaemonResponse::Error {
+                            message: format!("Task not found: {}", id),
+                        };
+                    }
+                    Err(e) => {
+                        return DaemonResponse::Error { message: e.to_string() };
+                    }
+                }
+            };
+
+            // Start execution
+            let mut exec = executor.lock().await;
+            match exec.start_task(task) {
+                Ok(()) => {
+                    // Update task status to Running
+                    let mut mgr = manager.lock().await;
+                    let _ = mgr.set_status(&task_id, TaskStatus::Running);
+                    DaemonResponse::TaskStarted { task_id: id }
+                }
+                Err(e) => DaemonResponse::Error { message: e.to_string() },
+            }
+        }
+
+        DaemonRequest::ProvideInput { id, input } => {
+            let task_id = TaskId::from_engram_id(&id);
+            let mut exec = executor.lock().await;
+            match exec.provide_input(&task_id, input).await {
+                Ok(()) => DaemonResponse::Ok {
+                    message: Some("Input provided".to_string()),
+                },
+                Err(e) => DaemonResponse::Error { message: e.to_string() },
+            }
+        }
+
+        DaemonRequest::AttachTask { id } => {
+            let task_id = TaskId::from_engram_id(&id);
+            let exec = executor.lock().await;
+
+            // Get current events
+            match exec.poll_events(&task_id).await {
+                Ok(events) => {
+                    if events.is_empty() {
+                        // Return current status instead
+                        if let Some(state) = exec.get_state(&task_id) {
+                            DaemonResponse::ExecutionStatusResponse {
+                                task_id: id,
+                                status: (&state.status).into(),
+                            }
+                        } else {
+                            DaemonResponse::ExecutionStatusResponse {
+                                task_id: id,
+                                status: ExecutionStatusDto::NotRunning,
+                            }
+                        }
+                    } else {
+                        // Return the most recent event
+                        let event = events.into_iter().last().unwrap();
+                        DaemonResponse::ExecutionUpdate {
+                            task_id: id,
+                            event: event.into(),
+                        }
+                    }
+                }
+                Err(e) => DaemonResponse::Error { message: e.to_string() },
+            }
+        }
+
+        DaemonRequest::GetExecutionStatus { id } => {
+            let task_id = TaskId::from_engram_id(&id);
+            let exec = executor.lock().await;
+
+            if let Some(state) = exec.get_state(&task_id) {
+                DaemonResponse::ExecutionStatusResponse {
+                    task_id: id,
+                    status: (&state.status).into(),
+                }
+            } else {
+                DaemonResponse::ExecutionStatusResponse {
+                    task_id: id,
+                    status: ExecutionStatusDto::NotRunning,
+                }
+            }
+        }
+
+        DaemonRequest::CancelTask { id } => {
+            let task_id = TaskId::from_engram_id(&id);
+            let mut exec = executor.lock().await;
+            match exec.cancel_task(&task_id) {
+                Ok(()) => {
+                    // Update task status to Cancelled
+                    let mut mgr = manager.lock().await;
+                    let _ = mgr.set_status(&task_id, TaskStatus::Cancelled);
+                    DaemonResponse::Ok {
+                        message: Some("Task cancelled".to_string()),
+                    }
+                }
                 Err(e) => DaemonResponse::Error { message: e.to_string() },
             }
         }
