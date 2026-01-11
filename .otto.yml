@@ -86,3 +86,37 @@ tasks:
       cargo install --path .
       echo "✅ Binary installed to ~/.cargo/bin"
 
+  # Run Rust examples in parallel
+  examples:
+    help: "Run all Rust examples in parallel"
+    foreach:
+      glob: "examples/*.rs"
+      as: example
+      parallel: true
+    bash: |
+      name=$(basename "${example}" .rs)
+      if cargo run --example "$name" --quiet 2>&1; then
+        echo "✅ $name passed"
+      else
+        echo "❌ $name failed"
+        exit 1
+      fi
+
+  # Run examples sequentially (for debugging)
+  examples-serial:
+    help: "Run all Rust examples sequentially"
+    foreach:
+      glob: "examples/*.rs"
+      as: example
+      parallel: false
+    bash: |
+      name=$(basename "${example}" .rs)
+      echo "--- Running $name ---"
+      if cargo run --example "$name" 2>&1; then
+        echo "✅ $name passed"
+      else
+        echo "❌ $name failed"
+        exit 1
+      fi
+      echo ""
+

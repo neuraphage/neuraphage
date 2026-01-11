@@ -11,5 +11,9 @@ pub mod syncer;
 pub mod watcher;
 
 pub use persona::{ModelTier, Persona, PersonaStore};
-pub use syncer::{SyncMessage, SyncResult, Syncer, SyncerConfig};
-pub use watcher::{TaskSnapshot, WatchResult, Watcher, WatcherConfig, WatcherRecommendation};
+pub use syncer::{
+    SyncMessage, SyncRelevance, SyncResult, SyncUrgency, Syncer, SyncerConfig, TaskRelationship, TaskSummary,
+};
+pub use watcher::{
+    TaskHealth, TaskSnapshot, ToolCallSummary, WatchResult, Watcher, WatcherConfig, WatcherRecommendation,
+};

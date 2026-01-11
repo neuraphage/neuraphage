@@ -13,5 +13,5 @@ pub mod scheduler;
 
 pub use event_bus::{Event, EventBus, EventKind};
 pub use knowledge::{Knowledge, KnowledgeKind, KnowledgeStore};
-pub use lock_manager::{Lock, LockManager, ResourceId};
+pub use lock_manager::{Lock, LockManager, LockResult, ResourceId};
 pub use scheduler::{ScheduleResult, Scheduler, SchedulerConfig};
