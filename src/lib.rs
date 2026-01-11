@@ -8,6 +8,7 @@ pub mod config;
 pub mod coordination;
 pub mod daemon;
 pub mod error;
+pub mod executor;
 pub mod personas;
 pub mod task;
 pub mod task_manager;
@@ -37,3 +38,6 @@ pub use ui::{App, AppState, Notification, NotificationKind, Notifier, Tui};
 pub use personas::{ModelTier, Persona, PersonaStore};
 pub use personas::{SyncMessage, SyncResult, Syncer, SyncerConfig};
 pub use personas::{TaskSnapshot, WatchResult, Watcher, WatcherConfig, WatcherRecommendation};
+
+// Re-export executor types
+pub use executor::{ExecutionEvent, ExecutionResult, ExecutionStatus, ExecutorConfig, TaskExecutor};
