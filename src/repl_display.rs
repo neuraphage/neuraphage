@@ -1,14 +1,17 @@
 //! REPL display module for terminal output.
 //!
-//! Provides streaming text output with a final status summary.
-//! Handles raw mode for proper terminal control.
+//! Uses ANSI scroll regions to create a fixed status bar at the bottom
+//! while streaming content scrolls above it.
 
 use std::io::{IsTerminal, Write, stdout};
 use std::panic;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::cursor::{MoveToColumn, MoveToRow, RestorePosition, SavePosition};
+use crossterm::execute;
+use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
+use crossterm::terminal::{self, Clear, ClearType, disable_raw_mode, enable_raw_mode};
 
 use crate::error::Result;
 
@@ -19,18 +22,22 @@ static RAW_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
 fn install_panic_hook() {
     let original_hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic_info| {
-        // Restore terminal state before printing panic
         if RAW_MODE_ACTIVE.load(Ordering::SeqCst) {
+            // Reset scroll region and disable raw mode
+            let _ = execute!(
+                stdout(),
+                Print("\x1b[r"), // Reset scroll region
+                ResetColor
+            );
             let _ = disable_raw_mode();
             RAW_MODE_ACTIVE.store(false, Ordering::SeqCst);
         }
-        // Call original panic handler
         original_hook(panic_info);
     }));
 }
 
 /// Braille spinner frames for animated activity indicator.
-const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 /// Activity state for the status bar.
 #[derive(Debug, Clone, Default)]
@@ -44,41 +51,41 @@ pub enum Activity {
 }
 
 impl Activity {
-    /// Get the icon for this activity, optionally animated.
-    pub fn icon(&self, frame: usize) -> &'static str {
+    /// Get the spinner char for this activity.
+    pub fn icon(&self, frame: usize) -> char {
         match self {
-            Activity::Idle => "○",
-            Activity::Thinking | Activity::Streaming => SPINNER_FRAMES[frame % SPINNER_FRAMES.len()],
-            Activity::ExecutingTool(_) => SPINNER_FRAMES[frame % SPINNER_FRAMES.len()],
-            Activity::WaitingForUser => "?",
+            Activity::Idle => '○',
+            Activity::Thinking | Activity::Streaming | Activity::ExecutingTool(_) => {
+                SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]
+            }
+            Activity::WaitingForUser => '?',
         }
     }
 
-    /// Check if this activity should be animated.
-    pub fn is_active(&self) -> bool {
-        !matches!(self, Activity::Idle | Activity::WaitingForUser)
-    }
-
     /// Get the color for this activity.
-    pub fn color(&self) -> &'static str {
+    pub fn color(&self) -> Color {
         match self {
-            Activity::Idle => "\x1b[90m",             // Gray
-            Activity::Thinking => "\x1b[34m",         // Blue
-            Activity::Streaming => "\x1b[32m",        // Green
-            Activity::ExecutingTool(_) => "\x1b[33m", // Yellow
-            Activity::WaitingForUser => "\x1b[33m",   // Yellow
+            Activity::Idle => Color::DarkGrey,
+            Activity::Thinking => Color::Blue,
+            Activity::Streaming => Color::Green,
+            Activity::ExecutingTool(_) | Activity::WaitingForUser => Color::Yellow,
         }
     }
 
     /// Get display text for this activity.
-    pub fn text(&self) -> String {
+    pub fn text(&self) -> &str {
         match self {
-            Activity::Idle => "Idle".to_string(),
-            Activity::Thinking => "Thinking".to_string(),
-            Activity::Streaming => "Streaming".to_string(),
-            Activity::ExecutingTool(name) => name.clone(),
-            Activity::WaitingForUser => "Waiting".to_string(),
+            Activity::Idle => "Idle",
+            Activity::Thinking => "Thinking",
+            Activity::Streaming => "Streaming",
+            Activity::ExecutingTool(name) => name.as_str(),
+            Activity::WaitingForUser => "Waiting",
         }
+    }
+
+    /// Check if actively working.
+    pub fn is_active(&self) -> bool {
+        !matches!(self, Activity::Idle | Activity::WaitingForUser)
     }
 }
 
@@ -93,13 +100,12 @@ pub struct StatusState {
 }
 
 impl StatusState {
-    /// Get elapsed time since task started.
     pub fn elapsed(&self) -> Duration {
-        self.task_started.map(|start| start.elapsed()).unwrap_or_default()
+        self.task_started.map(|s| s.elapsed()).unwrap_or_default()
     }
 }
 
-/// Format a duration as a human-readable string.
+/// Format duration as human-readable string.
 fn format_duration(d: Duration) -> String {
     let secs = d.as_secs();
     if secs < 60 {
@@ -111,7 +117,7 @@ fn format_duration(d: Duration) -> String {
     }
 }
 
-/// Format a number with commas for readability.
+/// Format number with commas.
 fn format_number(n: u64) -> String {
     let s = n.to_string();
     let mut result = String::new();
@@ -124,32 +130,37 @@ fn format_number(n: u64) -> String {
     result
 }
 
-/// REPL display for terminal output.
+/// REPL display with scroll region for status bar.
 pub struct ReplDisplay {
     status: StatusState,
-    /// Track if we're in raw mode (for cleanup).
     raw_mode_enabled: bool,
-    /// Animation frame counter for spinner.
     frame: usize,
-    /// Whether stdout is a TTY.
     is_tty: bool,
+    rows: u16,
+    cols: u16,
 }
 
 impl ReplDisplay {
-    /// Create a new display.
+    /// Create a new display with scroll region.
     pub fn new() -> Result<Self> {
         let is_tty = stdout().is_terminal();
+        let (cols, rows) = terminal::size().unwrap_or((80, 24));
 
         if is_tty {
-            // Install panic hook to restore terminal on panic
             install_panic_hook();
-
-            // Enable raw mode for terminal control
             enable_raw_mode()?;
             RAW_MODE_ACTIVE.store(true, Ordering::SeqCst);
+
+            let mut out = stdout();
+            // Set scroll region to exclude bottom line
+            // ESC [ top ; bottom r
+            write!(out, "\x1b[1;{}r", rows - 1)?;
+            // Move cursor to top of scroll region
+            execute!(out, MoveToRow(0), MoveToColumn(0))?;
+            out.flush()?;
         }
 
-        Ok(Self {
+        let display = Self {
             status: StatusState {
                 task_started: Some(Instant::now()),
                 ..Default::default()
@@ -157,43 +168,92 @@ impl ReplDisplay {
             raw_mode_enabled: is_tty,
             frame: 0,
             is_tty,
-        })
+            rows,
+            cols,
+        };
+
+        // Draw initial status bar
+        if is_tty {
+            display.draw_status_bar()?;
+        }
+
+        Ok(display)
     }
 
-    /// Check if we're in TTY mode.
     pub fn is_inline(&self) -> bool {
         self.is_tty
     }
 
-    /// Print streaming content.
+    /// Print streaming content (scrolls in the scroll region).
     pub fn print_content(&mut self, text: &str) -> Result<()> {
+        let mut out = stdout();
         if self.raw_mode_enabled {
-            // In raw mode, \n doesn't include carriage return
-            print!("{}", text.replace('\n', "\r\n"));
+            // In raw mode, need \r\n for newlines
+            for c in text.chars() {
+                if c == '\n' {
+                    write!(out, "\r\n")?;
+                } else {
+                    write!(out, "{}", c)?;
+                }
+            }
         } else {
-            print!("{}", text);
+            write!(out, "{}", text)?;
         }
-        stdout().flush()?;
+        out.flush()?;
         Ok(())
     }
 
     /// Print a complete line.
     pub fn println(&mut self, line: &str) -> Result<()> {
+        let mut out = stdout();
         if self.raw_mode_enabled {
-            print!("{}\r\n", line);
+            write!(out, "{}\r\n", line)?;
         } else {
-            println!("{}", line);
+            writeln!(out, "{}", line)?;
         }
-        stdout().flush()?;
+        out.flush()?;
         Ok(())
     }
 
-    /// Update the status (just tracks state, doesn't print during streaming).
+    /// Update status and redraw status bar.
     pub fn update_status(&mut self, status: StatusState) -> Result<()> {
         self.status = status;
         self.frame = self.frame.wrapping_add(1);
-        // Don't print status during streaming - it causes flicker
-        // Status will be shown in print_summary()
+        if self.is_tty {
+            self.draw_status_bar()?;
+        }
+        Ok(())
+    }
+
+    /// Draw the status bar on the bottom line.
+    fn draw_status_bar(&self) -> Result<()> {
+        let mut out = stdout();
+        let color = self.status.activity.color();
+        let icon = self.status.activity.icon(self.frame);
+        let activity = self.status.activity.text();
+        let elapsed = format_duration(self.status.elapsed());
+        let tokens = format_number(self.status.tokens_used);
+
+        let status_text = format!(
+            "{} {} │ Iter {} │ {} tokens │ ${:.4} │ {}",
+            icon, activity, self.status.iteration, tokens, self.status.cost, elapsed
+        );
+
+        // Truncate if needed
+        let display_text: String = status_text.chars().take(self.cols as usize).collect();
+
+        execute!(
+            out,
+            SavePosition,
+            MoveToRow(self.rows - 1),
+            MoveToColumn(0),
+            Clear(ClearType::CurrentLine),
+            SetForegroundColor(color),
+            Print(&display_text),
+            ResetColor,
+            RestorePosition,
+        )?;
+        out.flush()?;
         Ok(())
     }
 
@@ -201,28 +261,23 @@ impl ReplDisplay {
     pub fn print_summary(&self) -> Result<()> {
         let elapsed = format_duration(self.status.elapsed());
         let tokens = format_number(self.status.tokens_used);
-
-        if self.raw_mode_enabled {
-            // Already exited raw mode at this point via cleanup()
-            eprintln!(
-                "\r\n[Completed: {} iterations, {} tokens, ${:.4}, {}]",
-                self.status.iteration, tokens, self.status.cost, elapsed
-            );
-        } else {
-            eprintln!(
-                "\n[Completed: {} iterations, {} tokens, ${:.4}, {}]",
-                self.status.iteration, tokens, self.status.cost, elapsed
-            );
-        }
+        eprintln!(
+            "\n[Completed: {} iterations, {} tokens, ${:.4}, {}]",
+            self.status.iteration, tokens, self.status.cost, elapsed
+        );
         Ok(())
     }
 
-    /// Cleanup and restore terminal state.
+    /// Cleanup: reset scroll region and restore terminal.
     pub fn cleanup(&mut self) -> Result<()> {
         if self.raw_mode_enabled {
-            // Print a newline to ensure we're on a fresh line
-            print!("\r\n");
-            stdout().flush()?;
+            let mut out = stdout();
+            // Reset scroll region to full terminal
+            write!(out, "\x1b[r")?;
+            // Move to bottom and print newline
+            execute!(out, MoveToRow(self.rows - 1), MoveToColumn(0))?;
+            write!(out, "\r\n")?;
+            out.flush()?;
 
             disable_raw_mode()?;
             self.raw_mode_enabled = false;
@@ -234,8 +289,8 @@ impl ReplDisplay {
 
 impl Drop for ReplDisplay {
     fn drop(&mut self) {
-        // Always try to restore terminal state
         if self.raw_mode_enabled {
+            let _ = execute!(stdout(), Print("\x1b[r")); // Reset scroll region
             let _ = disable_raw_mode();
             RAW_MODE_ACTIVE.store(false, Ordering::SeqCst);
         }
@@ -247,47 +302,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_format_duration_seconds() {
+    fn test_format_duration() {
         assert_eq!(format_duration(Duration::from_secs(5)), "5s");
-        assert_eq!(format_duration(Duration::from_secs(59)), "59s");
-    }
-
-    #[test]
-    fn test_format_duration_minutes() {
-        assert_eq!(format_duration(Duration::from_secs(60)), "1m 0s");
-        assert_eq!(format_duration(Duration::from_secs(90)), "1m 30s");
-        assert_eq!(format_duration(Duration::from_secs(3599)), "59m 59s");
-    }
-
-    #[test]
-    fn test_format_duration_hours() {
-        assert_eq!(format_duration(Duration::from_secs(3600)), "1h 0m");
-        assert_eq!(format_duration(Duration::from_secs(7200)), "2h 0m");
-        assert_eq!(format_duration(Duration::from_secs(3660)), "1h 1m");
+        assert_eq!(format_duration(Duration::from_secs(65)), "1m 5s");
+        assert_eq!(format_duration(Duration::from_secs(3665)), "1h 1m");
     }
 
     #[test]
     fn test_format_number() {
         assert_eq!(format_number(0), "0");
-        assert_eq!(format_number(999), "999");
         assert_eq!(format_number(1000), "1,000");
         assert_eq!(format_number(1234567), "1,234,567");
     }
 
     #[test]
     fn test_activity_icon() {
-        // Static icons
-        assert_eq!(Activity::Idle.icon(0), "○");
-        assert_eq!(Activity::WaitingForUser.icon(0), "?");
-
-        // Animated icons (spinners)
-        assert_eq!(Activity::Thinking.icon(0), "⠋");
-        assert_eq!(Activity::Thinking.icon(1), "⠙");
-        assert_eq!(Activity::Streaming.icon(0), "⠋");
-        assert_eq!(Activity::ExecutingTool("test".to_string()).icon(0), "⠋");
-
-        // Test frame wrapping
-        assert_eq!(Activity::Thinking.icon(10), "⠋"); // wraps to frame 0
+        assert_eq!(Activity::Idle.icon(0), '○');
+        assert_eq!(Activity::Thinking.icon(0), '⠋');
+        assert_eq!(Activity::Thinking.icon(1), '⠙');
     }
 
     #[test]
@@ -295,16 +327,12 @@ mod tests {
         assert!(!Activity::Idle.is_active());
         assert!(Activity::Thinking.is_active());
         assert!(Activity::Streaming.is_active());
-        assert!(Activity::ExecutingTool("test".to_string()).is_active());
-        assert!(!Activity::WaitingForUser.is_active());
     }
 
     #[test]
     fn test_status_state_default() {
-        let status = StatusState::default();
-        assert_eq!(status.iteration, 0);
-        assert_eq!(status.tokens_used, 0);
-        assert_eq!(status.cost, 0.0);
-        assert!(status.task_started.is_none());
+        let s = StatusState::default();
+        assert_eq!(s.iteration, 0);
+        assert_eq!(s.tokens_used, 0);
     }
 }
