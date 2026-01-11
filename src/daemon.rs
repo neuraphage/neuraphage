@@ -60,6 +60,7 @@ pub enum DaemonRequest {
         priority: u8,
         tags: Vec<String>,
         context: Option<String>,
+        working_dir: Option<String>,
     },
     /// Get a task by ID.
     GetTask { id: String },
@@ -84,7 +85,7 @@ pub enum DaemonRequest {
     /// Get task counts.
     TaskCounts,
     /// Start executing a task.
-    StartTask { id: String },
+    StartTask { id: String, working_dir: Option<String> },
     /// Provide user input to a waiting task.
     ProvideInput { id: String, input: String },
     /// Attach to a task to receive execution updates.
@@ -407,6 +408,7 @@ async fn process_request(
             priority,
             tags,
             context,
+            ..
         } => {
             let tags_refs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
             let mut mgr = manager.lock().await;
@@ -517,7 +519,7 @@ async fn process_request(
             }
         }
 
-        DaemonRequest::StartTask { id } => {
+        DaemonRequest::StartTask { id, working_dir } => {
             let task_id = TaskId::from_engram_id(&id);
 
             // Get the task from the manager
@@ -536,9 +538,12 @@ async fn process_request(
                 }
             };
 
+            // Parse working directory
+            let working_dir = working_dir.map(std::path::PathBuf::from);
+
             // Start execution
             let mut exec = executor.lock().await;
-            match exec.start_task(task) {
+            match exec.start_task(task, working_dir) {
                 Ok(()) => {
                     // Update task status to Running
                     let mut mgr = manager.lock().await;
@@ -758,6 +763,7 @@ mod tests {
             priority: 2,
             tags: vec!["test".to_string()],
             context: None,
+            working_dir: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();

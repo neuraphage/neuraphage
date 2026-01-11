@@ -218,7 +218,7 @@ impl TaskExecutor {
     }
 
     /// Start executing a task.
-    pub fn start_task(&mut self, task: Task) -> Result<()> {
+    pub fn start_task(&mut self, task: Task, working_dir: Option<std::path::PathBuf>) -> Result<()> {
         if !self.can_start_task() {
             return Err(Error::Validation(format!(
                 "Cannot start task: at capacity ({} running)",
@@ -238,7 +238,7 @@ impl TaskExecutor {
         let (event_tx, event_rx) = mpsc::channel::<ExecutionEvent>(100);
 
         // Build agentic config
-        let working_dir = std::env::current_dir().unwrap_or_default();
+        let working_dir = working_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         let conversation_path = self
             .config
             .data_dir
@@ -878,7 +878,7 @@ mod tests {
         };
 
         // Start the task
-        executor.start_task(task).unwrap();
+        executor.start_task(task, None).unwrap();
 
         // Give the task time to execute (mock is fast)
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;

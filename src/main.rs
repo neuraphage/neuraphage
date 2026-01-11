@@ -173,11 +173,13 @@ async fn run_client_command(config: &Config, command: Command) -> Result<()> {
             tags,
             context,
         } => {
+            let working_dir = std::env::current_dir().ok().map(|d| d.to_string_lossy().to_string());
             let request = DaemonRequest::CreateTask {
                 description,
                 priority,
                 tags,
                 context,
+                working_dir,
             };
             let response = client.request(request).await?;
             handle_task_response(response);
@@ -274,17 +276,23 @@ async fn run_client_command(config: &Config, command: Command) -> Result<()> {
 
         Command::Run {
             description,
-            dir: _,
+            dir,
             priority,
             tags,
             context,
         } => {
+            // Use provided directory or current working directory
+            let working_dir = dir
+                .map(|d| d.to_string_lossy().to_string())
+                .or_else(|| std::env::current_dir().ok().map(|d| d.to_string_lossy().to_string()));
+
             // Create the task
             let request = DaemonRequest::CreateTask {
                 description: description.clone(),
                 priority,
                 tags,
                 context,
+                working_dir: working_dir.clone(),
             };
             let response = client.request(request).await?;
 
@@ -304,7 +312,10 @@ async fn run_client_command(config: &Config, command: Command) -> Result<()> {
             };
 
             // Start the task
-            let request = DaemonRequest::StartTask { id: task_id.clone() };
+            let request = DaemonRequest::StartTask {
+                id: task_id.clone(),
+                working_dir,
+            };
             let response = client.request(request).await?;
 
             match response {
@@ -327,7 +338,11 @@ async fn run_client_command(config: &Config, command: Command) -> Result<()> {
         }
 
         Command::Start { id } => {
-            let request = DaemonRequest::StartTask { id: id.clone() };
+            let working_dir = std::env::current_dir().ok().map(|d| d.to_string_lossy().to_string());
+            let request = DaemonRequest::StartTask {
+                id: id.clone(),
+                working_dir,
+            };
             let response = client.request(request).await?;
             match response {
                 DaemonResponse::TaskStarted { task_id } => {

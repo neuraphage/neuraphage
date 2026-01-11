@@ -278,6 +278,7 @@ impl Repl {
             priority: 2,
             tags: vec!["repl".to_string()],
             context: None,
+            working_dir: Some(self.session.working_dir.to_string_lossy().to_string()),
         };
 
         let response = self.client.request(request).await?;
@@ -291,8 +292,11 @@ impl Repl {
             _ => return Ok(()),
         };
 
-        // Start the task
-        let request = DaemonRequest::StartTask { id: task_id.clone() };
+        // Start the task with the working directory
+        let request = DaemonRequest::StartTask {
+            id: task_id.clone(),
+            working_dir: Some(self.session.working_dir.to_string_lossy().to_string()),
+        };
         self.client.request(request).await?;
 
         // Update session
@@ -312,6 +316,11 @@ impl Repl {
                 tokens_used,
                 cost,
             } => {
+                // If we're in the middle of streaming text, go to a new line first
+                if *mid_line {
+                    println!();
+                    *mid_line = false;
+                }
                 // Update the status line with current iteration stats
                 print!(
                     "\r{} Iteration {} | Tokens: {} | Cost: ${:.4}   ",
@@ -361,6 +370,10 @@ impl Repl {
                 *should_break = true;
             }
             ExecutionEventDto::TextDelta { content } => {
+                // If this is the first text after a status line, go to a new line
+                if !*mid_line {
+                    println!();
+                }
                 // Print streaming text immediately without newline
                 print!("{}", content);
                 std::io::stdout().flush().ok();
