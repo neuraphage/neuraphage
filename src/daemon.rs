@@ -149,6 +149,8 @@ pub enum ExecutionEventDto {
     ToolCalled { name: String, result: String },
     /// LLM response received.
     LlmResponse { content: String },
+    /// Streaming text delta from LLM.
+    TextDelta { content: String },
     /// Waiting for user input.
     WaitingForUser { prompt: String },
     /// Task completed.
@@ -171,6 +173,7 @@ impl From<ExecutionEvent> for ExecutionEventDto {
             },
             ExecutionEvent::ToolCalled { name, result } => ExecutionEventDto::ToolCalled { name, result },
             ExecutionEvent::LlmResponse { content } => ExecutionEventDto::LlmResponse { content },
+            ExecutionEvent::TextDelta { content } => ExecutionEventDto::TextDelta { content },
             ExecutionEvent::WaitingForUser { prompt } => ExecutionEventDto::WaitingForUser { prompt },
             ExecutionEvent::Completed { reason } => ExecutionEventDto::Completed { reason },
             ExecutionEvent::Failed { error } => ExecutionEventDto::Failed { error },

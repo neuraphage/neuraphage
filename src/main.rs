@@ -528,6 +528,11 @@ fn handle_execution_event(event: &ExecutionEventDto) {
             println!();
             println!("{}", content);
         }
+        ExecutionEventDto::TextDelta { content } => {
+            // Print streaming text immediately without newline
+            print!("{}", content);
+            std::io::stdout().flush().ok();
+        }
         ExecutionEventDto::WaitingForUser { prompt } => {
             println!();
             println!("{} {}", "?".yellow(), prompt);

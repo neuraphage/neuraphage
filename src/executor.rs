@@ -105,6 +105,8 @@ pub enum ExecutionEvent {
     ToolCalled { name: String, result: String },
     /// LLM response received.
     LlmResponse { content: String },
+    /// Streaming text delta from LLM.
+    TextDelta { content: String },
     /// Waiting for user input.
     WaitingForUser { prompt: String },
     /// Task completed.
