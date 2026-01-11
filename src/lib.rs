@@ -5,6 +5,7 @@
 
 pub mod agentic;
 pub mod config;
+pub mod coordination;
 pub mod daemon;
 pub mod error;
 pub mod task;
@@ -20,3 +21,9 @@ pub use task_manager::TaskManager;
 pub use agentic::{AgenticConfig, AgenticLoop, Conversation, IterationResult, Message, MessageRole};
 pub use agentic::{LlmClient, LlmConfig, LlmResponse};
 pub use agentic::{Tool, ToolCall, ToolExecutor, ToolResult};
+
+// Re-export coordination types
+pub use coordination::{Event, EventBus, EventKind};
+pub use coordination::{Knowledge, KnowledgeKind, KnowledgeStore};
+pub use coordination::{Lock, LockManager, ResourceId};
+pub use coordination::{ScheduleResult, Scheduler, SchedulerConfig};
