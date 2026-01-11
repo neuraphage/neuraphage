@@ -231,3 +231,69 @@ pub enum Command {
         id: String,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_daemon_start_default() {
+        let cli = Cli::parse_from(["np", "daemon", "start"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Daemon(DaemonCommand::Start {
+                foreground: false,
+                restart: false
+            }))
+        ));
+    }
+
+    #[test]
+    fn test_daemon_start_foreground() {
+        let cli = Cli::parse_from(["np", "daemon", "start", "-f"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Daemon(DaemonCommand::Start {
+                foreground: true,
+                restart: false
+            }))
+        ));
+    }
+
+    #[test]
+    fn test_daemon_start_restart() {
+        let cli = Cli::parse_from(["np", "daemon", "start", "-r"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Daemon(DaemonCommand::Start {
+                foreground: false,
+                restart: true
+            }))
+        ));
+    }
+
+    #[test]
+    fn test_daemon_start_foreground_restart() {
+        let cli = Cli::parse_from(["np", "daemon", "start", "-f", "-r"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Daemon(DaemonCommand::Start {
+                foreground: true,
+                restart: true
+            }))
+        ));
+    }
+
+    #[test]
+    fn test_daemon_stop() {
+        let cli = Cli::parse_from(["np", "daemon", "stop"]);
+        assert!(matches!(cli.command, Some(Command::Daemon(DaemonCommand::Stop))));
+    }
+
+    #[test]
+    fn test_daemon_status() {
+        let cli = Cli::parse_from(["np", "daemon", "status"]);
+        assert!(matches!(cli.command, Some(Command::Daemon(DaemonCommand::Status))));
+    }
+}
