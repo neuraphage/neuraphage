@@ -10,7 +10,7 @@ use colored::*;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::daemon::{DaemonClient, DaemonRequest, DaemonResponse, ExecutionStatusDto};
+use crate::daemon::{DaemonClient, DaemonRequest, DaemonResponse, ExecutionEventDto, ExecutionStatusDto};
 use crate::error::Result;
 use crate::task::TaskId;
 
@@ -304,9 +304,100 @@ impl Repl {
         Ok(())
     }
 
+    /// Handle a single execution event, updating display state.
+    fn handle_event(event: &ExecutionEventDto, mid_line: &mut bool, should_break: &mut bool) {
+        match event {
+            ExecutionEventDto::LlmResponse { content } => {
+                if *mid_line {
+                    println!();
+                    *mid_line = false;
+                }
+                println!();
+                println!("{}", content);
+            }
+            ExecutionEventDto::ToolCalled { name, result } => {
+                if *mid_line {
+                    println!();
+                    *mid_line = false;
+                }
+                println!();
+                println!("{} {}", "→".blue(), name.cyan());
+                let display = if result.len() > 200 {
+                    format!("{}...", &result[..200])
+                } else {
+                    result.clone()
+                };
+                println!("  {}", display.dimmed());
+            }
+            ExecutionEventDto::Completed { reason } => {
+                if *mid_line {
+                    println!();
+                }
+                println!();
+                println!("{} {}", "✓".green(), reason);
+                *should_break = true;
+            }
+            ExecutionEventDto::Failed { error } => {
+                if *mid_line {
+                    println!();
+                }
+                println!();
+                println!("{} {}", "✗".red(), error);
+                *should_break = true;
+            }
+            ExecutionEventDto::TextDelta { content } => {
+                // Print streaming text immediately without newline
+                print!("{}", content);
+                std::io::stdout().flush().ok();
+                *mid_line = true;
+            }
+            ExecutionEventDto::ActivityChanged { activity } => {
+                use crate::daemon::ActivityDto;
+                if *mid_line {
+                    println!();
+                    *mid_line = false;
+                }
+                let activity_str = match activity {
+                    ActivityDto::Thinking => "Thinking...",
+                    ActivityDto::Streaming => "Writing...",
+                    ActivityDto::ExecutingTool { name } => {
+                        println!("{} Running {}...", "⚙".blue(), name.cyan());
+                        return;
+                    }
+                    ActivityDto::WaitingForTool { name } => {
+                        println!("{} Waiting for {}...", "⏳".yellow(), name);
+                        return;
+                    }
+                    ActivityDto::Idle => return,
+                };
+                print!("\r{} {}   ", "●".blue(), activity_str);
+                std::io::stdout().flush().ok();
+            }
+            ExecutionEventDto::ToolStarted { name } => {
+                if *mid_line {
+                    println!();
+                    *mid_line = false;
+                }
+                println!("{} {}...", "⚙".blue(), name.cyan());
+            }
+            ExecutionEventDto::ToolCompleted { name, result } => {
+                // Display truncated result
+                let display = if result.len() > 200 {
+                    format!("{}...", &result[..200])
+                } else {
+                    result.clone()
+                };
+                println!("  {} {}", "✓".green(), name);
+                println!("  {}", display.dimmed());
+            }
+            _ => {}
+        }
+    }
+
     async fn wait_for_task(&mut self, task_id: &str) -> Result<()> {
         println!();
         let mut mid_line = false; // Track if we're in the middle of streaming output
+        let mut should_break = false;
 
         loop {
             let request = DaemonRequest::AttachTask {
@@ -369,49 +460,21 @@ impl Repl {
                     }
                 },
                 DaemonResponse::ExecutionUpdate { event, .. } => {
-                    use crate::daemon::ExecutionEventDto;
-                    match event {
-                        ExecutionEventDto::LlmResponse { content } => {
-                            if mid_line {
-                                println!();
-                                mid_line = false;
-                            }
-                            println!();
-                            println!("{}", content);
-                        }
-                        ExecutionEventDto::ToolCalled { name, result } => {
-                            if mid_line {
-                                println!();
-                                mid_line = false;
-                            }
-                            println!();
-                            println!("{} {}", "→".blue(), name.cyan());
-                            let display = if result.len() > 200 { format!("{}...", &result[..200]) } else { result };
-                            println!("  {}", display.dimmed());
-                        }
-                        ExecutionEventDto::Completed { reason } => {
-                            if mid_line {
-                                println!();
-                            }
-                            println!();
-                            println!("{} {}", "✓".green(), reason);
+                    Self::handle_event(&event, &mut mid_line, &mut should_break);
+                    if should_break {
+                        break;
+                    }
+                }
+                DaemonResponse::ExecutionEvents { events, .. } => {
+                    // Handle multiple events from the buffer
+                    for event in events {
+                        Self::handle_event(&event, &mut mid_line, &mut should_break);
+                        if should_break {
                             break;
                         }
-                        ExecutionEventDto::Failed { error } => {
-                            if mid_line {
-                                println!();
-                            }
-                            println!();
-                            println!("{} {}", "✗".red(), error);
-                            break;
-                        }
-                        ExecutionEventDto::TextDelta { content } => {
-                            // Print streaming text immediately without newline
-                            print!("{}", content);
-                            std::io::stdout().flush().ok();
-                            mid_line = true;
-                        }
-                        _ => {}
+                    }
+                    if should_break {
+                        break;
                     }
                 }
                 DaemonResponse::Error { message } => {

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::agentic::{AgenticConfig, AgenticLoop, AnthropicClient, IterationResult, LlmClient};
@@ -92,6 +92,33 @@ pub struct ExecutionState {
     pub last_activity: DateTime<Utc>,
 }
 
+/// Current activity of the agent.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Activity {
+    /// Calling the LLM API.
+    Thinking,
+    /// Streaming text response.
+    Streaming,
+    /// Executing a tool.
+    ExecutingTool { name: String },
+    /// Waiting for external response (web search, etc).
+    WaitingForTool { name: String },
+    /// Idle between iterations.
+    Idle,
+}
+
+impl std::fmt::Display for Activity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Activity::Thinking => write!(f, "Thinking..."),
+            Activity::Streaming => write!(f, "Writing..."),
+            Activity::ExecutingTool { name } => write!(f, "Running {}...", name),
+            Activity::WaitingForTool { name } => write!(f, "Waiting for {}...", name),
+            Activity::Idle => write!(f, "Idle"),
+        }
+    }
+}
+
 /// Event from task execution.
 #[derive(Debug, Clone)]
 pub enum ExecutionEvent {
@@ -113,6 +140,12 @@ pub enum ExecutionEvent {
     Completed { reason: String },
     /// Task failed.
     Failed { error: String },
+    /// Activity changed (for UX updates).
+    ActivityChanged { activity: Activity },
+    /// Tool execution started.
+    ToolStarted { name: String },
+    /// Tool execution completed.
+    ToolCompleted { name: String, result: String },
 }
 
 /// Handle to a running task.
@@ -122,9 +155,13 @@ struct RunningTask {
     /// Channel to send user input.
     input_tx: mpsc::Sender<String>,
     /// Channel to receive events.
-    event_rx: Arc<Mutex<mpsc::Receiver<ExecutionEvent>>>,
-    /// Current state.
+    event_rx: mpsc::Receiver<ExecutionEvent>,
+    /// Current state (mutable, updated from events).
     state: ExecutionState,
+    /// Buffer of recent events for replay to slow pollers.
+    event_buffer: std::collections::VecDeque<ExecutionEvent>,
+    /// Index tracking where client last read from buffer.
+    last_poll_idx: usize,
 }
 
 /// Result of task execution.
@@ -239,8 +276,10 @@ impl TaskExecutor {
             RunningTask {
                 handle,
                 input_tx,
-                event_rx: Arc::new(Mutex::new(event_rx)),
+                event_rx,
                 state,
+                event_buffer: std::collections::VecDeque::with_capacity(100),
+                last_poll_idx: 0,
             },
         );
 
@@ -269,23 +308,73 @@ impl TaskExecutor {
     }
 
     /// Poll for events from a task.
-    pub async fn poll_events(&self, task_id: &TaskId) -> Result<Vec<ExecutionEvent>> {
+    ///
+    /// This drains new events from the channel, updates state from them,
+    /// buffers them for replay, and returns events since last poll.
+    pub fn poll_events(&mut self, task_id: &TaskId) -> Result<Vec<ExecutionEvent>> {
         let running = self
             .running_tasks
-            .get(task_id)
+            .get_mut(task_id)
             .ok_or_else(|| Error::TaskNotFound { id: task_id.0.clone() })?;
 
-        let mut events = Vec::new();
-        let mut rx = running.event_rx.lock().await;
+        // Drain new events from channel and process them
+        while let Ok(event) = running.event_rx.try_recv() {
+            // Update state from events
+            running.state.last_activity = Utc::now();
+            match &event {
+                ExecutionEvent::IterationComplete {
+                    iteration,
+                    tokens_used,
+                    cost,
+                } => {
+                    running.state.status = ExecutionStatus::Running {
+                        iteration: *iteration,
+                        tokens_used: *tokens_used,
+                        cost: *cost,
+                    };
+                }
+                ExecutionEvent::WaitingForUser { prompt } => {
+                    running.state.status = ExecutionStatus::WaitingForUser { prompt: prompt.clone() };
+                }
+                ExecutionEvent::Completed { reason } => {
+                    running.state.status = ExecutionStatus::Completed { reason: reason.clone() };
+                }
+                ExecutionEvent::Failed { error } => {
+                    running.state.status = ExecutionStatus::Failed { error: error.clone() };
+                }
+                _ => {}
+            }
 
-        while let Ok(event) = rx.try_recv() {
-            events.push(event);
+            // Buffer the event for replay
+            running.event_buffer.push_back(event);
+
+            // Keep buffer bounded (max 100 events)
+            if running.event_buffer.len() > 100 {
+                running.event_buffer.pop_front();
+                // Adjust last_poll_idx if events were dropped
+                if running.last_poll_idx > 0 {
+                    running.last_poll_idx -= 1;
+                }
+            }
         }
+
+        // Return events since last poll
+        let events: Vec<ExecutionEvent> = running
+            .event_buffer
+            .iter()
+            .skip(running.last_poll_idx)
+            .cloned()
+            .collect();
+
+        // Update last poll index
+        running.last_poll_idx = running.event_buffer.len();
 
         Ok(events)
     }
 
     /// Check all running tasks and collect completed ones.
+    ///
+    /// This also drains events from all tasks to keep state updated.
     pub async fn poll_completed(&mut self) -> Vec<ExecutionResult> {
         let mut completed = Vec::new();
         let mut to_remove = Vec::new();
@@ -294,33 +383,41 @@ impl TaskExecutor {
             // Check if task finished
             if running.handle.is_finished() {
                 to_remove.push(task_id.clone());
-            } else {
-                // Update state from events
-                let mut rx = running.event_rx.lock().await;
-                while let Ok(event) = rx.try_recv() {
-                    running.state.last_activity = Utc::now();
-                    match &event {
-                        ExecutionEvent::IterationComplete {
-                            iteration,
-                            tokens_used,
-                            cost,
-                        } => {
-                            running.state.status = ExecutionStatus::Running {
-                                iteration: *iteration,
-                                tokens_used: *tokens_used,
-                                cost: *cost,
-                            };
-                        }
-                        ExecutionEvent::WaitingForUser { prompt } => {
-                            running.state.status = ExecutionStatus::WaitingForUser { prompt: prompt.clone() };
-                        }
-                        ExecutionEvent::Completed { reason } => {
-                            running.state.status = ExecutionStatus::Completed { reason: reason.clone() };
-                        }
-                        ExecutionEvent::Failed { error } => {
-                            running.state.status = ExecutionStatus::Failed { error: error.clone() };
-                        }
-                        _ => {}
+            }
+
+            // Always drain events to update state (even for finished tasks)
+            while let Ok(event) = running.event_rx.try_recv() {
+                running.state.last_activity = Utc::now();
+                match &event {
+                    ExecutionEvent::IterationComplete {
+                        iteration,
+                        tokens_used,
+                        cost,
+                    } => {
+                        running.state.status = ExecutionStatus::Running {
+                            iteration: *iteration,
+                            tokens_used: *tokens_used,
+                            cost: *cost,
+                        };
+                    }
+                    ExecutionEvent::WaitingForUser { prompt } => {
+                        running.state.status = ExecutionStatus::WaitingForUser { prompt: prompt.clone() };
+                    }
+                    ExecutionEvent::Completed { reason } => {
+                        running.state.status = ExecutionStatus::Completed { reason: reason.clone() };
+                    }
+                    ExecutionEvent::Failed { error } => {
+                        running.state.status = ExecutionStatus::Failed { error: error.clone() };
+                    }
+                    _ => {}
+                }
+
+                // Buffer the event
+                running.event_buffer.push_back(event);
+                if running.event_buffer.len() > 100 {
+                    running.event_buffer.pop_front();
+                    if running.last_poll_idx > 0 {
+                        running.last_poll_idx -= 1;
                     }
                 }
             }
@@ -646,5 +743,130 @@ mod tests {
             ExecutionEvent::IterationComplete { iteration, .. } => assert_eq!(iteration, 5),
             _ => panic!("Wrong variant"),
         }
+    }
+
+    #[test]
+    fn test_running_task_event_buffer() {
+        use std::collections::VecDeque;
+
+        // Test that event buffer maintains bounded size
+        let mut buffer: VecDeque<ExecutionEvent> = VecDeque::with_capacity(100);
+        let mut last_poll_idx: usize = 0;
+
+        // Add more than 100 events
+        for i in 0..150 {
+            buffer.push_back(ExecutionEvent::IterationComplete {
+                iteration: i,
+                tokens_used: (i * 10) as u64,
+                cost: i as f64 * 0.001,
+            });
+
+            // Keep buffer bounded
+            if buffer.len() > 100 {
+                buffer.pop_front();
+                last_poll_idx = last_poll_idx.saturating_sub(1);
+            }
+        }
+
+        // Buffer should be at capacity
+        assert_eq!(buffer.len(), 100);
+
+        // Events since last poll
+        let events: Vec<_> = buffer.iter().skip(last_poll_idx).cloned().collect();
+        assert_eq!(events.len(), 100);
+
+        // Update poll index
+        last_poll_idx = buffer.len();
+
+        // No events since last poll
+        let events: Vec<_> = buffer.iter().skip(last_poll_idx).cloned().collect();
+        assert_eq!(events.len(), 0);
+    }
+
+    #[test]
+    fn test_state_update_from_iteration_complete() {
+        // Test that ExecutionState is updated correctly from IterationComplete events
+        let mut state = ExecutionState {
+            task_id: TaskId("test".to_string()),
+            status: ExecutionStatus::Running {
+                iteration: 0,
+                tokens_used: 0,
+                cost: 0.0,
+            },
+            started_at: Utc::now(),
+            last_activity: Utc::now(),
+        };
+
+        // Simulate processing an IterationComplete event
+        let event = ExecutionEvent::IterationComplete {
+            iteration: 5,
+            tokens_used: 1234,
+            cost: 0.0567,
+        };
+
+        if let ExecutionEvent::IterationComplete {
+            iteration,
+            tokens_used,
+            cost,
+        } = &event
+        {
+            state.status = ExecutionStatus::Running {
+                iteration: *iteration,
+                tokens_used: *tokens_used,
+                cost: *cost,
+            };
+            state.last_activity = Utc::now();
+        }
+
+        // Verify state was updated
+        match state.status {
+            ExecutionStatus::Running {
+                iteration,
+                tokens_used,
+                cost,
+            } => {
+                assert_eq!(iteration, 5);
+                assert_eq!(tokens_used, 1234);
+                assert!((cost - 0.0567).abs() < 0.0001);
+            }
+            _ => panic!("Expected Running status"),
+        }
+    }
+
+    #[test]
+    fn test_event_buffer_replay() {
+        use std::collections::VecDeque;
+
+        // Simulate slow poller scenario
+        let mut buffer: VecDeque<ExecutionEvent> = VecDeque::with_capacity(100);
+        let mut last_poll_idx = 0;
+
+        // Send 10 events before first poll
+        for i in 0..10 {
+            buffer.push_back(ExecutionEvent::TextDelta {
+                content: format!("chunk{}", i),
+            });
+        }
+
+        // First poll should get all 10 events
+        let events: Vec<_> = buffer.iter().skip(last_poll_idx).cloned().collect();
+        assert_eq!(events.len(), 10);
+        last_poll_idx = buffer.len();
+
+        // Send 5 more events
+        for i in 10..15 {
+            buffer.push_back(ExecutionEvent::TextDelta {
+                content: format!("chunk{}", i),
+            });
+        }
+
+        // Second poll should get only the new 5 events
+        let events: Vec<_> = buffer.iter().skip(last_poll_idx).cloned().collect();
+        assert_eq!(events.len(), 5);
+        last_poll_idx = buffer.len();
+
+        // Third poll with no new events
+        let events: Vec<_> = buffer.iter().skip(last_poll_idx).cloned().collect();
+        assert_eq!(events.len(), 0);
     }
 }

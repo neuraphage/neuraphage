@@ -14,7 +14,8 @@ mod cli;
 use cli::{Cli, Command};
 use neuraphage::config::Config;
 use neuraphage::daemon::{
-    Daemon, DaemonClient, DaemonRequest, DaemonResponse, ExecutionEventDto, ExecutionStatusDto, is_daemon_running,
+    ActivityDto, Daemon, DaemonClient, DaemonRequest, DaemonResponse, ExecutionEventDto, ExecutionStatusDto,
+    is_daemon_running,
 };
 use neuraphage::repl::Repl;
 
@@ -568,6 +569,44 @@ fn handle_execution_event(event: &ExecutionEventDto, mid_line: &mut bool) {
             }
             println!();
             println!("{} Task failed: {}", "✗".red(), error);
+        }
+        ExecutionEventDto::ActivityChanged { activity } => {
+            if *mid_line {
+                println!();
+                *mid_line = false;
+            }
+            let activity_str = match activity {
+                ActivityDto::Thinking => "Thinking...",
+                ActivityDto::Streaming => "Writing...",
+                ActivityDto::ExecutingTool { name } => {
+                    println!("{} Running {}...", "⚙".blue(), name.cyan());
+                    return;
+                }
+                ActivityDto::WaitingForTool { name } => {
+                    println!("{} Waiting for {}...", "⏳".yellow(), name);
+                    return;
+                }
+                ActivityDto::Idle => return,
+            };
+            print!("\r{} {}   ", "●".blue(), activity_str);
+            std::io::stdout().flush().ok();
+        }
+        ExecutionEventDto::ToolStarted { name } => {
+            if *mid_line {
+                println!();
+                *mid_line = false;
+            }
+            println!("{} {}...", "⚙".blue(), name.cyan());
+        }
+        ExecutionEventDto::ToolCompleted { name, result } => {
+            // Display truncated result
+            let display = if result.len() > 200 {
+                format!("{}...", &result[..200])
+            } else {
+                result.clone()
+            };
+            println!("  {} {}", "✓".green(), name);
+            println!("  {}", display.dimmed());
         }
     }
 }

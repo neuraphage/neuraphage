@@ -9,7 +9,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
 use crate::error::{Error, Result};
-use crate::executor::{ExecutionEvent, ExecutionStatus, ExecutorConfig, TaskExecutor};
+use crate::executor::{Activity, ExecutionEvent, ExecutionStatus, ExecutorConfig, TaskExecutor};
 use crate::task::{Task, TaskId, TaskStatus};
 use crate::task_manager::TaskManager;
 
@@ -121,8 +121,13 @@ pub enum DaemonResponse {
     },
     /// Error response.
     Error { message: String },
-    /// Execution update (for attached clients).
+    /// Execution update (for attached clients) - single event.
     ExecutionUpdate { task_id: String, event: ExecutionEventDto },
+    /// Execution events (for attached clients) - multiple events.
+    ExecutionEvents {
+        task_id: String,
+        events: Vec<ExecutionEventDto>,
+    },
     /// Task waiting for input.
     WaitingForInput { task_id: String, prompt: String },
     /// Execution status response.
@@ -134,6 +139,33 @@ pub enum DaemonResponse {
     TaskStarted { task_id: String },
     /// Shutdown acknowledgment.
     Shutdown,
+}
+
+/// DTO for activity (serializable version of Activity).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ActivityDto {
+    /// Calling the LLM API.
+    Thinking,
+    /// Streaming text response.
+    Streaming,
+    /// Executing a tool.
+    ExecutingTool { name: String },
+    /// Waiting for external response.
+    WaitingForTool { name: String },
+    /// Idle between iterations.
+    Idle,
+}
+
+impl From<Activity> for ActivityDto {
+    fn from(activity: Activity) -> Self {
+        match activity {
+            Activity::Thinking => ActivityDto::Thinking,
+            Activity::Streaming => ActivityDto::Streaming,
+            Activity::ExecutingTool { name } => ActivityDto::ExecutingTool { name },
+            Activity::WaitingForTool { name } => ActivityDto::WaitingForTool { name },
+            Activity::Idle => ActivityDto::Idle,
+        }
+    }
 }
 
 /// DTO for execution events (serializable version of ExecutionEvent).
@@ -157,6 +189,12 @@ pub enum ExecutionEventDto {
     Completed { reason: String },
     /// Task failed.
     Failed { error: String },
+    /// Activity changed.
+    ActivityChanged { activity: ActivityDto },
+    /// Tool execution started.
+    ToolStarted { name: String },
+    /// Tool execution completed.
+    ToolCompleted { name: String, result: String },
 }
 
 impl From<ExecutionEvent> for ExecutionEventDto {
@@ -177,6 +215,11 @@ impl From<ExecutionEvent> for ExecutionEventDto {
             ExecutionEvent::WaitingForUser { prompt } => ExecutionEventDto::WaitingForUser { prompt },
             ExecutionEvent::Completed { reason } => ExecutionEventDto::Completed { reason },
             ExecutionEvent::Failed { error } => ExecutionEventDto::Failed { error },
+            ExecutionEvent::ActivityChanged { activity } => ExecutionEventDto::ActivityChanged {
+                activity: activity.into(),
+            },
+            ExecutionEvent::ToolStarted { name } => ExecutionEventDto::ToolStarted { name },
+            ExecutionEvent::ToolCompleted { name, result } => ExecutionEventDto::ToolCompleted { name, result },
         }
     }
 }
@@ -519,14 +562,17 @@ async fn process_request(
 
         DaemonRequest::AttachTask { id } => {
             let task_id = TaskId::from_engram_id(&id);
-            let exec = executor.lock().await;
+            let mut exec = executor.lock().await;
 
-            // Get current events
-            match exec.poll_events(&task_id).await {
+            // Get current events (poll_events now updates state and buffers events)
+            match exec.poll_events(&task_id) {
                 Ok(events) => {
+                    // Get the current state (always fresh since poll_events updates it)
+                    let state = exec.get_state(&task_id);
+
                     if events.is_empty() {
-                        // Return current status instead
-                        if let Some(state) = exec.get_state(&task_id) {
+                        // No new events - return current status
+                        if let Some(state) = state {
                             DaemonResponse::ExecutionStatusResponse {
                                 task_id: id,
                                 status: (&state.status).into(),
@@ -538,11 +584,10 @@ async fn process_request(
                             }
                         }
                     } else {
-                        // Return the most recent event
-                        let event = events.into_iter().last().unwrap();
-                        DaemonResponse::ExecutionUpdate {
+                        // Return ALL events since last poll (not just last one)
+                        DaemonResponse::ExecutionEvents {
                             task_id: id,
-                            event: event.into(),
+                            events: events.into_iter().map(|e| e.into()).collect(),
                         }
                     }
                 }

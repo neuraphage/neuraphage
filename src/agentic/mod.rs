@@ -151,16 +151,38 @@ impl<L: LlmClient> AgenticLoop<L> {
         // Build the context
         let messages = self.build_context(task)?;
 
+        // Signal we're about to call the LLM
+        if let Some(event_tx) = &self.event_tx {
+            let _ = event_tx
+                .send(ExecutionEvent::ActivityChanged {
+                    activity: crate::executor::Activity::Thinking,
+                })
+                .await;
+        }
+
         // Call the LLM (streaming or non-streaming based on event_tx)
         let response = if let Some(event_tx) = &self.event_tx {
             // Use streaming - forward text deltas as they arrive
             let (chunk_tx, mut chunk_rx) = mpsc::channel::<StreamChunk>(100);
             let event_tx_clone = event_tx.clone();
+            let event_tx_activity = event_tx.clone();
+
+            // Track if we've sent the streaming activity
+            let mut first_chunk = true;
 
             // Spawn a task to forward text deltas
             let forward_task = tokio::spawn(async move {
                 while let Some(chunk) = chunk_rx.recv().await {
                     if let StreamChunk::TextDelta(text) = chunk {
+                        // Signal streaming started on first chunk
+                        if first_chunk {
+                            let _ = event_tx_activity
+                                .send(ExecutionEvent::ActivityChanged {
+                                    activity: crate::executor::Activity::Streaming,
+                                })
+                                .await;
+                            first_chunk = false;
+                        }
                         let _ = event_tx_clone.send(ExecutionEvent::TextDelta { content: text }).await;
                     }
                 }
@@ -183,6 +205,15 @@ impl<L: LlmClient> AgenticLoop<L> {
                 .await?
         };
 
+        // Signal we're idle after LLM response
+        if let Some(event_tx) = &self.event_tx {
+            let _ = event_tx
+                .send(ExecutionEvent::ActivityChanged {
+                    activity: crate::executor::Activity::Idle,
+                })
+                .await;
+        }
+
         // Update usage
         self.tokens_used += response.tokens_used;
         self.cost += response.cost;
@@ -200,8 +231,44 @@ impl<L: LlmClient> AgenticLoop<L> {
             info!("Executing {} tool calls", response.tool_calls.len());
             for tool_call in &response.tool_calls {
                 info!("Executing tool: {} (id: {})", tool_call.name, tool_call.id);
+
+                // Signal tool execution started
+                if let Some(event_tx) = &self.event_tx {
+                    let _ = event_tx
+                        .send(ExecutionEvent::ActivityChanged {
+                            activity: crate::executor::Activity::ExecutingTool {
+                                name: tool_call.name.clone(),
+                            },
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(ExecutionEvent::ToolStarted {
+                            name: tool_call.name.clone(),
+                        })
+                        .await;
+                }
+
                 let result = self.tools.execute(tool_call).await?;
                 debug!("Tool result (truncated): {:.200}", result.output);
+
+                // Signal tool completed
+                if let Some(event_tx) = &self.event_tx {
+                    let _ = event_tx
+                        .send(ExecutionEvent::ToolCompleted {
+                            name: tool_call.name.clone(),
+                            result: if result.output.len() > 200 {
+                                format!("{}...", &result.output[..200])
+                            } else {
+                                result.output.clone()
+                            },
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(ExecutionEvent::ActivityChanged {
+                            activity: crate::executor::Activity::Idle,
+                        })
+                        .await;
+                }
 
                 // Add tool result to conversation
                 self.conversation.add_message(Message {
