@@ -301,7 +301,9 @@ impl<L: LlmClient> AgenticLoop<L> {
             return Ok(IterationResult::Continue);
         }
 
-        // No tool calls - check if the response indicates completion
+        // No tool calls - the model has responded without requesting any actions.
+        // If the model ended its turn naturally, treat it as task completion.
+        // This is correct for REPL/conversational mode where the model just answers questions.
         info!(
             "No tool calls. stop_reason={:?}, content_len={}",
             response.stop_reason,
@@ -309,16 +311,14 @@ impl<L: LlmClient> AgenticLoop<L> {
         );
         debug!("Response content (truncated): {:.500}", response.content);
 
-        if response.stop_reason == Some("end_turn".to_string()) {
-            // The model ended its turn without tool calls
-            // This could mean it's done or waiting for input
-            if response.content.contains("TASK_COMPLETE") {
-                return Ok(IterationResult::Completed {
-                    reason: response.content,
-                });
-            }
+        if response.stop_reason == Some("end_turn".to_string()) && !response.content.is_empty() {
+            // Model ended its turn with a response - it's done
+            return Ok(IterationResult::Completed {
+                reason: "Model completed response".to_string(),
+            });
         }
 
+        // Empty response or unexpected stop reason - continue to get clarification
         Ok(IterationResult::Continue)
     }
 
@@ -460,8 +460,8 @@ mod tests {
         let task = make_test_task("test-task-1");
         let result = agentic_loop.iterate(&task).await.unwrap();
 
-        // Should continue (no tool calls, no TASK_COMPLETE)
-        assert!(matches!(result, IterationResult::Continue));
+        // Should complete (model responded and ended turn)
+        assert!(matches!(result, IterationResult::Completed { .. }));
 
         // Collect events from channel
         let mut text_deltas = Vec::new();
@@ -507,10 +507,10 @@ mod tests {
         let mut agentic_loop = AgenticLoop::new(config, mock_llm, None).unwrap();
         agentic_loop.add_user_message("Test").unwrap();
 
-        // Should work without streaming
+        // Should complete (model responded and ended turn)
         let task = make_test_task("test-task-2");
         let result = agentic_loop.iterate(&task).await.unwrap();
-        assert!(matches!(result, IterationResult::Continue));
+        assert!(matches!(result, IterationResult::Completed { .. }));
 
         // Verify tokens and cost were tracked
         assert_eq!(agentic_loop.tokens_used(), 30);
