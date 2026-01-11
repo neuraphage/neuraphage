@@ -16,6 +16,8 @@ mod tools;
 
 use std::path::PathBuf;
 
+use log::{debug, info};
+
 use crate::error::Result;
 use crate::task::Task;
 
@@ -119,6 +121,7 @@ impl<L: LlmClient> AgenticLoop<L> {
     /// Run a single iteration of the loop.
     pub async fn iterate(&mut self, task: &Task) -> Result<IterationResult> {
         self.iteration += 1;
+        info!("Starting iteration {} for task {}", self.iteration, task.id);
 
         // Check limits
         if self.iteration > self.config.max_iterations {
@@ -162,8 +165,11 @@ impl<L: LlmClient> AgenticLoop<L> {
 
         // If there are tool calls, execute them
         if !response.tool_calls.is_empty() {
+            info!("Executing {} tool calls", response.tool_calls.len());
             for tool_call in &response.tool_calls {
+                info!("Executing tool: {} (id: {})", tool_call.name, tool_call.id);
                 let result = self.tools.execute(tool_call).await?;
+                debug!("Tool result (truncated): {:.200}", result.output);
 
                 // Add tool result to conversation
                 self.conversation.add_message(Message {
@@ -191,6 +197,13 @@ impl<L: LlmClient> AgenticLoop<L> {
         }
 
         // No tool calls - check if the response indicates completion
+        info!(
+            "No tool calls. stop_reason={:?}, content_len={}",
+            response.stop_reason,
+            response.content.len()
+        );
+        debug!("Response content (truncated): {:.500}", response.content);
+
         if response.stop_reason == Some("end_turn".to_string()) {
             // The model ended its turn without tool calls
             // This could mean it's done or waiting for input
