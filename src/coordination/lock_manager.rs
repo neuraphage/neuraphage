@@ -85,7 +85,6 @@ pub struct LockManager {
     /// Which resources each task is waiting for.
     waiting_for: Arc<Mutex<HashMap<TaskId, ResourceId>>>,
     /// Default lock timeout.
-    #[allow(dead_code)]
     default_timeout: Duration,
 }
 
@@ -293,6 +292,11 @@ impl LockManager {
             total_shared_holders,
             total_resources: locks.len(),
         }
+    }
+
+    /// Get the default lock timeout.
+    pub fn default_timeout(&self) -> Duration {
+        self.default_timeout
     }
 }
 

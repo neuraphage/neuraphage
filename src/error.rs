@@ -31,9 +31,13 @@ pub enum Error {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Serialization error
+    /// JSON serialization error
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    /// YAML serialization error
+    #[error("yaml error: {0}")]
+    Yaml(#[from] serde_yaml::Error),
 
     /// Daemon error
     #[error("daemon error: {0}")]

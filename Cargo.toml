@@ -37,6 +37,7 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
+humantime = "2"
 
 # ID generation
 uuid = { version = "1", features = ["v7", "serde"] }

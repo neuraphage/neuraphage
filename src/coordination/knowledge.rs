@@ -96,7 +96,6 @@ pub struct KnowledgeStore {
     /// Index by kind.
     kind_index: Arc<Mutex<HashMap<KnowledgeKind, Vec<String>>>>,
     /// Storage path for persistence.
-    #[allow(dead_code)]
     storage_path: Option<PathBuf>,
 }
 
@@ -207,10 +206,11 @@ impl KnowledgeStore {
             .cloned()
             .collect();
 
-        // Sort by relevance * log(use_count + 1) to favor both relevant and useful
+        // Sort by relevance with a bonus for frequently used items
+        // Formula: relevance + 0.1 * log(use_count + 1) ensures relevance is primary
         results.sort_by(|a, b| {
-            let score_a = a.relevance * (a.use_count as f32 + 1.0).ln();
-            let score_b = b.relevance * (b.use_count as f32 + 1.0).ln();
+            let score_a = a.relevance + 0.1 * (a.use_count as f32 + 1.0).ln();
+            let score_b = b.relevance + 0.1 * (b.use_count as f32 + 1.0).ln();
             score_b.partial_cmp(&score_a).unwrap()
         });
 
@@ -284,6 +284,11 @@ impl KnowledgeStore {
             unique_tags: tag_index.len(),
             total_uses: items.values().map(|k| k.use_count as usize).sum(),
         }
+    }
+
+    /// Get the storage path (if configured for persistence).
+    pub fn storage_path(&self) -> Option<&PathBuf> {
+        self.storage_path.as_ref()
     }
 }
 
