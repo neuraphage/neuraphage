@@ -11,6 +11,7 @@ pub mod error;
 pub mod executor;
 pub mod personas;
 pub mod repl;
+pub mod safety;
 pub mod task;
 pub mod task_manager;
 pub mod ui;
@@ -45,3 +46,6 @@ pub use executor::{ExecutionEvent, ExecutionResult, ExecutionStatus, ExecutorCon
 
 // Re-export REPL types
 pub use repl::{Repl, ReplInput, Session};
+
+// Re-export safety types
+pub use safety::{SafetyCheckResult, SafetyChecker, SafetyConfig};
