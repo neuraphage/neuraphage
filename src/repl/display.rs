@@ -79,20 +79,26 @@ impl ReplScreen {
         Ok(Self { is_tty, rows, cols })
     }
 
-    /// Print welcome message.
+    /// Print welcome message with logo.
     pub fn print_welcome(&self) -> Result<()> {
         if self.is_tty {
             let mut out = stdout();
+
+            // Display the braille logo
+            let logo = include_str!("../../art/neuraphage-logo.txt");
+            for line in logo.lines() {
+                execute!(
+                    out,
+                    SetForegroundColor(Color::Cyan),
+                    Print(line),
+                    ResetColor,
+                    Print("\r\n")
+                )?;
+            }
+
             execute!(
                 out,
-                SetForegroundColor(Color::Cyan),
-                Print("Neuraphage REPL"),
-                ResetColor,
-                Print("\r\n")
-            )?;
-            execute!(
-                out,
-                Print("Type a message to start, or "),
+                Print("\r\nType a message to start, or "),
                 SetForegroundColor(Color::Yellow),
                 Print("/help"),
                 ResetColor,
