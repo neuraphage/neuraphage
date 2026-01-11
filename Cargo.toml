@@ -32,6 +32,8 @@ async-trait = "0.1"
 
 # Terminal
 colored = "3"
+ratatui = { version = "0.29", features = ["all-widgets"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
