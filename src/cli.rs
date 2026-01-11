@@ -78,14 +78,32 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
+/// Daemon lifecycle commands.
 #[derive(Subcommand)]
-pub enum Command {
+pub enum DaemonCommand {
     /// Start the daemon
-    Daemon {
+    Start {
         /// Run in foreground (don't daemonize)
         #[arg(short, long)]
         foreground: bool,
+
+        /// Restart: stop daemon first if already running
+        #[arg(short, long)]
+        restart: bool,
     },
+
+    /// Stop the daemon
+    Stop,
+
+    /// Check daemon status
+    Status,
+}
+
+#[derive(Subcommand)]
+pub enum Command {
+    /// Manage the neuraphage daemon
+    #[command(subcommand)]
+    Daemon(DaemonCommand),
 
     /// Create a new task
     New {
@@ -172,12 +190,6 @@ pub enum Command {
 
     /// Show task statistics
     Stats,
-
-    /// Stop the daemon
-    Stop,
-
-    /// Check daemon status
-    Ping,
 
     /// Run a task interactively (create, start, and attach)
     Run {

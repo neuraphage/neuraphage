@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 mod cli;
 
-use cli::{Cli, Command};
+use cli::{Cli, Command, DaemonCommand};
 use neuraphage::config::Config;
 use neuraphage::daemon::{
     ActivityDto, Daemon, DaemonClient, DaemonRequest, DaemonResponse, ExecutionEventDto, ExecutionStatusDto,
@@ -49,15 +49,37 @@ fn main() -> Result<()> {
     // Parse CLI args first (before any async runtime)
     let cli = Cli::parse();
 
-    // Check if this is a daemon command that needs to fork
-    if let Some(Command::Daemon { foreground: false }) = &cli.command {
-        // Daemonize BEFORE starting tokio runtime
+    // CRITICAL: Background daemon start must happen BEFORE tokio runtime.
+    // The tokio runtime cannot survive a fork.
+    if let Some(Command::Daemon(DaemonCommand::Start {
+        foreground: false,
+        restart,
+    })) = &cli.command
+    {
         let config = Config::load(cli.config.as_ref()).context("Failed to load configuration")?;
         let daemon_config = config.to_daemon_config();
 
         if is_daemon_running(&daemon_config) {
-            eprintln!("{} Daemon is already running", "!".yellow());
-            return Ok(());
+            if *restart {
+                // Stop the running daemon first (need a brief tokio runtime for this)
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(async {
+                    if let Ok(mut client) = DaemonClient::connect(&daemon_config).await {
+                        client.request(DaemonRequest::Shutdown).await.ok();
+                    }
+                });
+                // Wait for daemon to stop
+                std::thread::sleep(std::time::Duration::from_millis(500));
+
+                // Check if it actually stopped
+                if is_daemon_running(&daemon_config) {
+                    eprintln!("{} Daemon did not stop in time, aborting", "!".red());
+                    return Ok(());
+                }
+            } else {
+                eprintln!("{} Daemon is already running (use -r to restart)", "!".yellow());
+                return Ok(());
+            }
         }
 
         return daemonize(&daemon_config);
@@ -76,24 +98,87 @@ async fn async_main(cli: Cli) -> Result<()> {
     info!("Starting with config from: {:?}", cli.config);
 
     match cli.command {
-        Some(Command::Daemon { foreground: true }) => {
-            // Foreground daemon mode
-            let daemon_config = config.to_daemon_config();
+        Some(Command::Daemon(daemon_cmd)) => handle_daemon_command(&config, daemon_cmd).await,
+        Some(cmd) => run_client_command(&config, cmd).await,
+        None => run_repl(&config).await,
+    }
+}
+
+/// Handle daemon lifecycle commands.
+async fn handle_daemon_command(config: &Config, cmd: DaemonCommand) -> Result<()> {
+    let daemon_config = config.to_daemon_config();
+
+    match cmd {
+        DaemonCommand::Start {
+            foreground: true,
+            restart,
+        } => {
+            // Foreground mode - runs in current process
             if is_daemon_running(&daemon_config) {
-                eprintln!("{} Daemon is already running", "!".yellow());
-                return Ok(());
+                if restart {
+                    // Stop the running daemon first
+                    let mut client = DaemonClient::connect(&daemon_config).await?;
+                    client.request(DaemonRequest::Shutdown).await?;
+                    // Wait for daemon to stop
+                    for _ in 0..20 {
+                        if !is_daemon_running(&daemon_config) {
+                            break;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    }
+                    if is_daemon_running(&daemon_config) {
+                        eprintln!("{} Daemon did not stop in time", "!".red());
+                        return Ok(());
+                    }
+                } else {
+                    eprintln!("{} Daemon is already running (use -r to restart)", "!".yellow());
+                    return Ok(());
+                }
             }
             println!("{} Starting daemon in foreground...", "→".blue());
             let daemon = Daemon::new(daemon_config)?;
             daemon.run().await?;
             Ok(())
         }
-        Some(Command::Daemon { foreground: false }) => {
-            // This shouldn't be reached (handled in main), but just in case
-            unreachable!("Background daemon should be handled before tokio starts")
+        DaemonCommand::Start { foreground: false, .. } => {
+            // Should not reach here - handled in main() before tokio
+            unreachable!("Background daemon start handled before tokio runtime")
         }
-        Some(cmd) => run_client_command(&config, cmd).await,
-        None => run_repl(&config).await,
+        DaemonCommand::Stop => {
+            if !is_daemon_running(&daemon_config) {
+                eprintln!("{} Daemon is not running", "!".yellow());
+                return Ok(());
+            }
+            let mut client = DaemonClient::connect(&daemon_config).await?;
+            let response = client.request(DaemonRequest::Shutdown).await?;
+            match response {
+                DaemonResponse::Shutdown => println!("{} Daemon stopped", "✓".green()),
+                DaemonResponse::Error { message } => eprintln!("{} {}", "✗".red(), message),
+                _ => {}
+            }
+            Ok(())
+        }
+        DaemonCommand::Status => {
+            if daemon_config.socket_path.exists() {
+                match DaemonClient::connect(&daemon_config).await {
+                    Ok(mut client) => match client.request(DaemonRequest::Ping).await {
+                        Ok(DaemonResponse::Pong) => {
+                            println!("{} Daemon is running", "✓".green());
+                        }
+                        _ => {
+                            println!("{} Daemon not responding", "!".yellow());
+                        }
+                    },
+                    Err(_) => {
+                        println!("{} Stale socket (daemon not running)", "!".yellow());
+                        println!("  Socket: {}", daemon_config.socket_path.display());
+                    }
+                }
+            } else {
+                println!("{} Daemon is not running", "○".yellow());
+            }
+            Ok(())
+        }
     }
 }
 
@@ -165,7 +250,7 @@ async fn run_client_command(config: &Config, command: Command) -> Result<()> {
     let mut client = DaemonClient::connect(&daemon_config).await?;
 
     match command {
-        Command::Daemon { .. } => unreachable!(),
+        Command::Daemon(_) => unreachable!(),
 
         Command::New {
             description,
@@ -252,26 +337,6 @@ async fn run_client_command(config: &Config, command: Command) -> Result<()> {
             let request = DaemonRequest::TaskCounts;
             let response = client.request(request).await?;
             handle_counts_response(response);
-        }
-
-        Command::Stop => {
-            let request = DaemonRequest::Shutdown;
-            let response = client.request(request).await?;
-            match response {
-                DaemonResponse::Shutdown => println!("{} Daemon stopped", "✓".green()),
-                DaemonResponse::Error { message } => eprintln!("{} {}", "✗".red(), message),
-                _ => {}
-            }
-        }
-
-        Command::Ping => {
-            let request = DaemonRequest::Ping;
-            let response = client.request(request).await?;
-            match response {
-                DaemonResponse::Pong => println!("{} Daemon is running", "✓".green()),
-                DaemonResponse::Error { message } => eprintln!("{} {}", "✗".red(), message),
-                _ => {}
-            }
         }
 
         Command::Run {
