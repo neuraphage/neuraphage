@@ -1,0 +1,694 @@
+# Design Document: Daemon CLI Refactoring
+
+**Author:** Claude (with Scott Idler)
+**Date:** 2026-01-11
+**Status:** Draft
+**Review Passes:** 4/5
+
+## Summary
+
+Refactor neuraphage's CLI structure to consolidate daemon-related commands (`daemon`, `stop`, `ping`) under a single `daemon` subcommand with nested operations, following the pattern established in the `aka` project.
+
+## Problem Statement
+
+### Background
+
+Neuraphage uses clap for CLI argument parsing. The current design places all commands at the same level in a flat `Command` enum. This includes daemon lifecycle commands (`Daemon`, `Stop`, `Ping`) alongside task management commands (`New`, `List`, `Show`, etc.).
+
+### Problem
+
+The current CLI structure is confusing because:
+
+1. **Inconsistent command grouping**: `Stop` and `Ping` are daemon operations but appear as peers to `Daemon` rather than being nested under it
+2. **Unclear command relationships**: Users can't tell that `stop` and `ping` require the daemon to be running
+3. **Flat namespace pollution**: All 19 commands compete at the top level, making help output overwhelming
+4. **Discoverability issues**: New users don't know that daemon commands exist or how they relate
+
+Current confused structure:
+```
+np daemon [-f]     # Start daemon
+np stop            # Stop daemon (but not nested under daemon)
+np ping            # Check daemon (but not nested under daemon)
+np new ...
+np list ...
+```
+
+### Goals
+
+- Consolidate all daemon lifecycle commands under a single `daemon` subcommand
+- Improve CLI discoverability and help text
+- Follow established patterns from the `aka` project
+- Maintain backwards compatibility during transition (if desired)
+
+### Non-Goals
+
+- Refactoring task management commands (separate design)
+- Changing the daemon's internal architecture
+- Modifying the daemon/client protocol
+
+## Proposed Solution
+
+### Overview
+
+Move `Stop` and `Ping` commands under the `Daemon` subcommand using clap's nested subcommand pattern. The `daemon` command will have its own `DaemonCommand` enum for lifecycle operations.
+
+### Architecture
+
+#### Option A: Nested Subcommands (Recommended)
+
+```
+np daemon start [-f|--foreground]  # Start daemon
+np daemon stop                     # Stop daemon
+np daemon status                   # Check if daemon is running (renamed from ping)
+np daemon restart                  # Convenience: stop + start
+```
+
+This approach uses clap's subcommand nesting:
+
+```rust
+#[derive(Subcommand)]
+pub enum Command {
+    /// Manage the daemon
+    #[command(subcommand)]
+    Daemon(DaemonCommand),
+
+    // ... task commands ...
+}
+
+#[derive(Subcommand)]
+pub enum DaemonCommand {
+    /// Start the daemon
+    Start {
+        /// Run in foreground (don't daemonize)
+        #[arg(short, long)]
+        foreground: bool,
+    },
+
+    /// Stop the daemon
+    Stop,
+
+    /// Check daemon status
+    Status,
+
+    /// Restart the daemon
+    Restart {
+        /// Run in foreground after restart
+        #[arg(short, long)]
+        foreground: bool,
+    },
+}
+```
+
+#### Option B: Flag-Based (AKA Style)
+
+```
+np daemon --start [-f]   # Start daemon
+np daemon --stop         # Stop daemon
+np daemon --status       # Check status
+np daemon --restart      # Restart
+```
+
+This uses boolean flags (like `aka`):
+
+```rust
+#[derive(Parser)]
+pub struct DaemonOpts {
+    #[arg(long, help = "Start the daemon")]
+    start: bool,
+
+    #[arg(long, help = "Stop the daemon")]
+    stop: bool,
+
+    #[arg(long, help = "Show daemon status")]
+    status: bool,
+
+    #[arg(long, help = "Restart the daemon")]
+    restart: bool,
+
+    #[arg(short, long, help = "Run in foreground (with --start)")]
+    foreground: bool,
+}
+```
+
+### Comparison
+
+| Aspect | Option A (Nested Subcommands) | Option B (Flags) |
+|--------|------------------------------|------------------|
+| Discoverability | Better - `np daemon --help` shows subcommands | Worse - flags are less obvious |
+| Tab completion | Better - each subcommand completes separately | Worse - all flags compete |
+| Extensibility | Better - easy to add command-specific args | Worse - flag combinations get complex |
+| Help text | Better - each subcommand has own help | Worse - single help page for all |
+| User familiarity | Standard pattern (`git remote add`) | Less common pattern |
+| Implementation | Slightly more code | Simpler, but needs manual validation |
+
+**Recommendation: Option A (Nested Subcommands)**
+
+While `aka` uses the flag-based approach, nested subcommands are more idiomatic for clap and provide better UX for complex operations. The pattern is familiar from tools like `git`, `docker`, and `cargo`.
+
+### Critical Implementation Note: Daemonize Before Tokio
+
+The current code handles a critical constraint: **daemonization must happen BEFORE the tokio runtime starts**. The tokio runtime cannot survive a fork. This is why `main()` checks for background daemon mode before creating the runtime:
+
+```rust
+// In main() - BEFORE tokio runtime
+if let Some(Command::Daemon(DaemonCommand::Start { foreground: false })) = &cli.command {
+    // Daemonize BEFORE starting tokio runtime
+    return daemonize(&daemon_config);
+}
+
+// Only then create tokio runtime
+let rt = tokio::runtime::Runtime::new()?;
+```
+
+This constraint must be preserved in the refactored code.
+
+### Data Model
+
+No changes to the daemon protocol or data structures. This is a CLI-only refactor.
+
+### API Design
+
+#### New CLI Structure
+
+```rust
+// src/cli.rs
+
+#[derive(Parser)]
+#[command(
+    name = "neuraphage",
+    about = "Multi-task AI orchestrator daemon",
+    version = env!("GIT_DESCRIBE"),
+    after_help = AFTER_HELP.as_str()
+)]
+pub struct Cli {
+    #[arg(short, long, global = true)]
+    pub config: Option<PathBuf>,
+
+    #[arg(short, long, global = true)]
+    pub verbose: bool,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+pub enum Command {
+    /// Manage the neuraphage daemon
+    #[command(subcommand)]
+    Daemon(DaemonCommand),
+
+    // === Task Management ===
+    /// Create a new task
+    New { /* ... */ },
+
+    /// List tasks
+    #[command(alias = "ls")]
+    List { /* ... */ },
+
+    /// Show task details
+    Show { id: String },
+
+    /// Show ready tasks
+    Ready,
+
+    /// Show blocked tasks
+    Blocked,
+
+    /// Set task status
+    Status { id: String, status: String },
+
+    /// Close a task
+    Close { /* ... */ },
+
+    /// Add dependency between tasks
+    Depend { blocked: String, blocker: String },
+
+    /// Remove dependency between tasks
+    Undepend { blocked: String, blocker: String },
+
+    /// Show task statistics
+    Stats,
+
+    // === Task Execution ===
+    /// Run a task interactively (create, start, attach)
+    Run { /* ... */ },
+
+    /// Attach to a running task
+    Attach { id: String },
+
+    /// Start a task
+    Start { id: String },
+
+    /// Cancel a running task
+    Cancel { id: String },
+}
+
+#[derive(Subcommand)]
+pub enum DaemonCommand {
+    /// Start the daemon
+    Start {
+        /// Run in foreground (don't daemonize)
+        #[arg(short, long)]
+        foreground: bool,
+    },
+
+    /// Stop the daemon
+    Stop,
+
+    /// Check daemon status
+    Status,
+
+    /// Restart the daemon (stop then start)
+    Restart {
+        /// Run in foreground after restart
+        #[arg(short, long)]
+        foreground: bool,
+    },
+}
+```
+
+#### Command Handler Changes
+
+**Important**: Background daemon start must be handled in `main()` BEFORE tokio runtime, while other daemon commands can be async.
+
+```rust
+// src/main.rs
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // CRITICAL: Background daemon start must happen before tokio runtime
+    // The tokio runtime cannot survive a fork
+    if let Some(Command::Daemon(DaemonCommand::Start { foreground: false })) = &cli.command {
+        let config = Config::load(cli.config.as_ref())?;
+        let daemon_config = config.to_daemon_config();
+
+        if is_daemon_running(&daemon_config) {
+            eprintln!("{} Daemon is already running", "!".yellow());
+            return Ok(());
+        }
+        return daemonize(&daemon_config);
+    }
+
+    // CRITICAL: Background restart also needs pre-tokio handling
+    if let Some(Command::Daemon(DaemonCommand::Restart { foreground: false })) = &cli.command {
+        let config = Config::load(cli.config.as_ref())?;
+        let daemon_config = config.to_daemon_config();
+
+        // Stop synchronously if running (brief connection)
+        if is_daemon_running(&daemon_config) {
+            // Use a mini runtime just for the stop request
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                if let Ok(mut client) = DaemonClient::connect(&daemon_config).await {
+                    client.request(DaemonRequest::Shutdown).await.ok();
+                }
+            });
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        return daemonize(&daemon_config);
+    }
+
+    // All other commands run with tokio
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async_main(cli))
+}
+
+async fn async_main(cli: Cli) -> Result<()> {
+    setup_logging()?;
+    let config = Config::load(cli.config.as_ref())?;
+
+    match cli.command {
+        Some(Command::Daemon(daemon_cmd)) => {
+            handle_daemon_command(&config, daemon_cmd).await
+        }
+        Some(cmd) => run_client_command(&config, cmd).await,
+        None => run_repl(&config).await,
+    }
+}
+
+/// Handle daemon commands that can run within tokio runtime
+/// (foreground start, stop, status, foreground restart)
+async fn handle_daemon_command(config: &Config, cmd: DaemonCommand) -> Result<()> {
+    let daemon_config = config.to_daemon_config();
+
+    match cmd {
+        DaemonCommand::Start { foreground: true } => {
+            // Foreground mode - runs in current process
+            if is_daemon_running(&daemon_config) {
+                eprintln!("{} Daemon is already running", "!".yellow());
+                return Ok(());
+            }
+            println!("{} Starting daemon in foreground...", "->".blue());
+            let daemon = Daemon::new(daemon_config)?;
+            daemon.run().await?;
+        }
+        DaemonCommand::Start { foreground: false } => {
+            // Should not reach here - handled in main() before tokio
+            unreachable!("Background daemon start handled before tokio runtime");
+        }
+        DaemonCommand::Stop => {
+            if !is_daemon_running(&daemon_config) {
+                eprintln!("{} Daemon is not running", "!".yellow());
+                return Ok(());
+            }
+            let mut client = DaemonClient::connect(&daemon_config).await?;
+            let response = client.request(DaemonRequest::Shutdown).await?;
+            match response {
+                DaemonResponse::Shutdown => println!("{} Daemon stopped", "ok".green()),
+                DaemonResponse::Error { message } => eprintln!("{} {}", "x".red(), message),
+                _ => {}
+            }
+        }
+        DaemonCommand::Status => {
+            if is_daemon_running(&daemon_config) {
+                let mut client = DaemonClient::connect(&daemon_config).await?;
+                let response = client.request(DaemonRequest::Ping).await?;
+                match response {
+                    DaemonResponse::Pong => println!("{} Daemon is running", "ok".green()),
+                    _ => println!("{} Daemon socket exists but not responding", "!".yellow()),
+                }
+            } else {
+                println!("{} Daemon is not running", "x".red());
+            }
+        }
+        DaemonCommand::Restart { foreground: true } => {
+            // Stop if running
+            if is_daemon_running(&daemon_config) {
+                let mut client = DaemonClient::connect(&daemon_config).await?;
+                client.request(DaemonRequest::Shutdown).await?;
+                // Wait for daemon to fully stop
+                wait_for_daemon_stop(&daemon_config).await;
+            }
+            // Start in foreground
+            println!("{} Starting daemon in foreground...", "->".blue());
+            let daemon = Daemon::new(daemon_config)?;
+            daemon.run().await?;
+        }
+        DaemonCommand::Restart { foreground: false } => {
+            // Should not reach here - handled in main() before tokio
+            unreachable!("Background daemon restart handled before tokio runtime");
+        }
+    }
+    Ok(())
+}
+
+/// Wait for daemon to stop (socket to be removed or connection refused)
+async fn wait_for_daemon_stop(daemon_config: &DaemonConfig) {
+    for _ in 0..20 {  // Max 2 seconds
+        if !is_daemon_running(daemon_config) {
+            return;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+}
+```
+
+### Implementation Plan
+
+#### Phase 1: Add DaemonCommand enum
+- Create `DaemonCommand` enum with `Start`, `Stop`, `Status`, `Restart` variants
+- Update `Command` enum to nest `Daemon(DaemonCommand)`
+- Keep old `Stop` and `Ping` variants temporarily for compatibility
+
+#### Phase 2: Refactor main.rs handler
+- Create `handle_daemon_command()` function
+- Move daemon logic out of `run_client_command()`
+- Handle the special case of background daemonization in `main()`
+
+#### Phase 3: Update help text and documentation
+- Rename `Ping` to `Status` (more intuitive)
+- Update any documentation/README
+- Update shell completions if applicable
+
+#### Phase 4: Remove deprecated commands
+- Remove top-level `Stop` and `Ping` variants
+- Clean up any dead code
+
+### Expected Help Text Output
+
+After refactoring, `np --help` will show:
+
+```
+neuraphage - Multi-task AI orchestrator daemon
+
+Usage: np [OPTIONS] [COMMAND]
+
+Commands:
+  daemon   Manage the neuraphage daemon
+  new      Create a new task
+  list     List tasks
+  show     Show task details
+  ready    Show ready tasks
+  ...
+```
+
+And `np daemon --help` will show:
+
+```
+Manage the neuraphage daemon
+
+Usage: np daemon <COMMAND>
+
+Commands:
+  start    Start the daemon
+  stop     Stop the daemon
+  status   Check daemon status
+  restart  Restart the daemon
+```
+
+### Migration Strategy
+
+For users with existing scripts using `np stop` or `np ping`:
+
+1. **Immediate removal** (recommended): Since neuraphage is pre-1.0, breaking changes are acceptable. Remove old commands outright.
+
+2. **Deprecation period** (if needed): Keep old commands but emit a warning:
+   ```rust
+   #[deprecated(note = "Use `np daemon stop` instead")]
+   Stop,
+   ```
+   This would print: `warning: `np stop` is deprecated, use `np daemon stop``
+
+## Alternatives Considered
+
+### Alternative 1: Keep Flat Structure
+
+**Description:** Leave the CLI as-is with all commands at the top level.
+
+**Pros:**
+- No migration needed
+- Fewer keystrokes for common operations
+
+**Cons:**
+- Continues the confusing design
+- Poor discoverability
+- Hard to extend with more daemon operations
+
+**Why not chosen:** The current structure is objectively confusing and violates the principle of least surprise.
+
+### Alternative 2: Command Groups via Aliases
+
+**Description:** Keep flat structure but add aliases like `daemon-stop`, `daemon-ping`.
+
+**Pros:**
+- Backwards compatible
+- Clear naming
+
+**Cons:**
+- Still pollutes the namespace
+- Doesn't leverage clap's subcommand capabilities
+- Inconsistent with modern CLI conventions
+
+**Why not chosen:** This is a half-measure that doesn't solve the core problem.
+
+### Alternative 3: Task Subcommand Too
+
+**Description:** Also group task commands under `np task <cmd>`.
+
+**Pros:**
+- Maximum organization
+- Clean separation of concerns
+
+**Cons:**
+- Breaking change for all commands
+- More typing for common operations
+- Scope creep
+
+**Why not chosen:** Out of scope for this design. Task command grouping should be a separate design decision.
+
+## Technical Considerations
+
+### Dependencies
+
+- clap (already in use) - no new dependencies
+
+### Performance
+
+No performance impact. This is purely a CLI parsing change.
+
+### Security
+
+No security implications. CLI structure doesn't affect security.
+
+### Testing Strategy
+
+1. **Unit tests**: Test CLI parsing with the new structure
+2. **Integration tests**: Ensure daemon lifecycle commands work correctly
+3. **Manual testing**: Verify help text, tab completion, error messages
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_daemon_start_parse() {
+        let cli = Cli::parse_from(["np", "daemon", "start"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Daemon(DaemonCommand::Start { foreground: false }))
+        ));
+    }
+
+    #[test]
+    fn test_daemon_start_foreground() {
+        let cli = Cli::parse_from(["np", "daemon", "start", "-f"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Daemon(DaemonCommand::Start { foreground: true }))
+        ));
+    }
+
+    #[test]
+    fn test_daemon_stop_parse() {
+        let cli = Cli::parse_from(["np", "daemon", "stop"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Daemon(DaemonCommand::Stop))
+        ));
+    }
+}
+```
+
+### Rollout Plan
+
+1. Implement new structure
+2. Add deprecation warnings for old commands (optional)
+3. Update documentation
+4. Release as minor version bump (if deprecating) or patch (if removing)
+
+## Edge Cases and Error Handling
+
+### `np daemon` without subcommand
+
+Clap will display help automatically when a subcommand is required but not provided:
+
+```
+$ np daemon
+error: 'np daemon' requires a subcommand but one was not provided
+
+Usage: np daemon <COMMAND>
+
+Commands:
+  start    Start the daemon
+  stop     Stop the daemon
+  status   Check daemon status
+  restart  Restart the daemon
+
+For more information, try '--help'.
+```
+
+This is the desired behavior - no code needed.
+
+### Stale socket file
+
+The `is_daemon_running()` function already handles stale sockets by attempting a connection:
+
+```rust
+fn is_daemon_running(config: &DaemonConfig) -> bool {
+    if !config.socket_path.exists() {
+        return false;
+    }
+    // Try to connect - if it fails, socket is stale
+    UnixStream::connect(&config.socket_path).is_ok()
+}
+```
+
+For `status` command, we should report stale sockets explicitly:
+
+```rust
+DaemonCommand::Status => {
+    if config.socket_path.exists() {
+        match DaemonClient::connect(&daemon_config).await {
+            Ok(mut client) => {
+                // Socket exists and is connectable
+                match client.request(DaemonRequest::Ping).await {
+                    Ok(DaemonResponse::Pong) => {
+                        println!("{} Daemon is running", "ok".green());
+                    }
+                    _ => {
+                        println!("{} Daemon not responding", "!".yellow());
+                    }
+                }
+            }
+            Err(_) => {
+                println!("{} Stale socket (daemon not running)", "!".yellow());
+                println!("  Socket: {}", config.socket_path.display());
+            }
+        }
+    } else {
+        println!("{} Daemon is not running", "x".red());
+    }
+}
+```
+
+### Restart fails to stop daemon
+
+If the daemon doesn't stop within the timeout, restart should fail gracefully:
+
+```rust
+// In background restart handling (pre-tokio)
+if is_daemon_running(&daemon_config) {
+    // ... send shutdown ...
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // Check if it actually stopped
+    if is_daemon_running(&daemon_config) {
+        eprintln!("{} Daemon did not stop in time, aborting restart", "!".red());
+        return Ok(());
+    }
+}
+```
+
+### Concurrent operations
+
+If multiple clients try to stop the daemon simultaneously, the daemon should handle this gracefully. The first `Shutdown` request succeeds; subsequent connections will fail with "connection refused" which is the expected behavior.
+
+### Permission errors
+
+Socket creation may fail if the directory doesn't exist or isn't writable. The daemon already creates the directory with `create_dir_all`. Errors should propagate with clear messages.
+
+## Risks and Mitigations
+
+| Risk | Likelihood | Impact | Mitigation |
+|------|------------|--------|------------|
+| Users have scripts using `np stop` | Medium | Low | Add deprecation warning pointing to `np daemon stop` |
+| Tab completion breaks | Low | Low | Regenerate shell completions |
+| Help text becomes unclear | Low | Medium | Carefully craft help strings for nested structure |
+| Restart hangs on unresponsive daemon | Low | Medium | Add timeout and clear error message |
+| Stale socket confuses users | Low | Low | `status` command reports stale sockets explicitly |
+
+## Open Questions
+
+- [x] Should we rename `ping` to `status`? **Yes** - `status` is more intuitive
+- [ ] Should we add a `daemon logs` subcommand for viewing logs?
+- [ ] Should we support `np d start` as a shorthand alias for `np daemon start`?
+- [ ] Do we need backwards compatibility aliases for `np stop` -> `np daemon stop`?
+
+## References
+
+- [AKA project daemon implementation](~/repos/scottidler/aka/src/bin/aka.rs)
+- [Clap derive documentation](https://docs.rs/clap/latest/clap/_derive/index.html)
+- [Clap subcommand tutorial](https://docs.rs/clap/latest/clap/_tutorial/chapter_1/index.html)

@@ -15,6 +15,9 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::error::Result;
 
+/// Braille spinner frames for animated activity indicator.
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 /// Activity state for the status bar.
 #[derive(Debug, Clone, Default)]
 pub enum Activity {
@@ -27,15 +30,19 @@ pub enum Activity {
 }
 
 impl Activity {
-    /// Get the icon for this activity.
-    pub fn icon(&self) -> &'static str {
+    /// Get the icon for this activity, optionally animated.
+    pub fn icon(&self, frame: usize) -> &'static str {
         match self {
             Activity::Idle => "○",
-            Activity::Thinking => "●",
-            Activity::Streaming => "●",
-            Activity::ExecutingTool(_) => "⚙",
+            Activity::Thinking | Activity::Streaming => SPINNER_FRAMES[frame % SPINNER_FRAMES.len()],
+            Activity::ExecutingTool(_) => SPINNER_FRAMES[frame % SPINNER_FRAMES.len()],
             Activity::WaitingForUser => "?",
         }
+    }
+
+    /// Check if this activity should be animated.
+    pub fn is_active(&self) -> bool {
+        !matches!(self, Activity::Idle | Activity::WaitingForUser)
     }
 
     /// Get the color for this activity.
@@ -119,6 +126,8 @@ pub struct ReplDisplay {
     status: StatusState,
     /// Track if we're in raw mode (for cleanup).
     raw_mode_enabled: bool,
+    /// Animation frame counter for spinner.
+    frame: usize,
 }
 
 impl ReplDisplay {
@@ -147,6 +156,7 @@ impl ReplDisplay {
                     ..Default::default()
                 },
                 raw_mode_enabled: true,
+                frame: 0,
             })
         } else {
             Ok(Self {
@@ -156,6 +166,7 @@ impl ReplDisplay {
                     ..Default::default()
                 },
                 raw_mode_enabled: false,
+                frame: 0,
             })
         }
     }
@@ -203,6 +214,8 @@ impl ReplDisplay {
     /// Update the status bar.
     pub fn update_status(&mut self, status: StatusState) -> Result<()> {
         self.status = status;
+        // Advance spinner frame for animation
+        self.frame = self.frame.wrapping_add(1);
 
         // Pre-compute values before borrowing terminal
         let color = self.status.activity.color();
@@ -233,7 +246,7 @@ impl ReplDisplay {
 
     /// Format the status line to fit within the given width.
     fn format_status_line(&self, max_width: usize) -> String {
-        let icon = self.status.activity.icon();
+        let icon = self.status.activity.icon(self.frame);
         let activity = self.status.activity.text();
         let elapsed = format_duration(self.status.elapsed());
         let tokens = format_number(self.status.tokens_used);
@@ -316,11 +329,27 @@ mod tests {
 
     #[test]
     fn test_activity_icon() {
-        assert_eq!(Activity::Idle.icon(), "○");
-        assert_eq!(Activity::Thinking.icon(), "●");
-        assert_eq!(Activity::Streaming.icon(), "●");
-        assert_eq!(Activity::ExecutingTool("test".to_string()).icon(), "⚙");
-        assert_eq!(Activity::WaitingForUser.icon(), "?");
+        // Static icons
+        assert_eq!(Activity::Idle.icon(0), "○");
+        assert_eq!(Activity::WaitingForUser.icon(0), "?");
+
+        // Animated icons (spinners)
+        assert_eq!(Activity::Thinking.icon(0), "⠋");
+        assert_eq!(Activity::Thinking.icon(1), "⠙");
+        assert_eq!(Activity::Streaming.icon(0), "⠋");
+        assert_eq!(Activity::ExecutingTool("test".to_string()).icon(0), "⠋");
+
+        // Test frame wrapping
+        assert_eq!(Activity::Thinking.icon(10), "⠋"); // wraps to frame 0
+    }
+
+    #[test]
+    fn test_activity_is_active() {
+        assert!(!Activity::Idle.is_active());
+        assert!(Activity::Thinking.is_active());
+        assert!(Activity::Streaming.is_active());
+        assert!(Activity::ExecutingTool("test".to_string()).is_active());
+        assert!(!Activity::WaitingForUser.is_active());
     }
 
     #[test]
