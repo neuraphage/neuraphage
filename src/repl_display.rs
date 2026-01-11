@@ -1,5 +1,9 @@
 //! REPL display module for terminal output.
 //!
+//! Two-level architecture:
+//! 1. ReplScreen - manages alternate screen buffer for entire REPL session
+//! 2. ReplDisplay - manages raw mode and streaming for individual tasks
+//!
 //! Uses ANSI scroll regions to create a fixed status bar at the bottom
 //! while streaming content scrolls above it.
 
@@ -17,21 +21,124 @@ use crossterm::terminal::{
 
 use crate::error::Result;
 
+/// Global flag tracking if alternate screen is active (for panic hook).
+static ALT_SCREEN_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 /// Global flag tracking if raw mode is enabled (for panic hook).
 static RAW_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Install panic hook to restore terminal state on panic.
 fn install_panic_hook() {
+    static HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
+    if HOOK_INSTALLED.swap(true, Ordering::SeqCst) {
+        return; // Already installed
+    }
+
     let original_hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic_info| {
+        // Restore terminal state
         if RAW_MODE_ACTIVE.load(Ordering::SeqCst) {
-            // Leave alternate screen and disable raw mode
-            let _ = execute!(stdout(), LeaveAlternateScreen, ResetColor);
             let _ = disable_raw_mode();
             RAW_MODE_ACTIVE.store(false, Ordering::SeqCst);
         }
+        if ALT_SCREEN_ACTIVE.load(Ordering::SeqCst) {
+            let _ = execute!(stdout(), LeaveAlternateScreen, ResetColor);
+            ALT_SCREEN_ACTIVE.store(false, Ordering::SeqCst);
+        }
         original_hook(panic_info);
     }));
+}
+
+/// REPL screen manager - handles alternate screen for entire REPL session.
+/// Create at REPL start, drop (or call leave()) at REPL exit.
+pub struct ReplScreen {
+    is_tty: bool,
+    rows: u16,
+    cols: u16,
+}
+
+impl ReplScreen {
+    /// Enter the REPL screen (alternate buffer with scroll region).
+    pub fn enter() -> Result<Self> {
+        let is_tty = stdout().is_terminal();
+        let (cols, rows) = terminal::size().unwrap_or((80, 24));
+
+        if is_tty {
+            install_panic_hook();
+
+            let mut out = stdout();
+            // Enter alternate screen buffer (like vim, htop, etc.)
+            execute!(out, EnterAlternateScreen)?;
+            ALT_SCREEN_ACTIVE.store(true, Ordering::SeqCst);
+
+            // Set scroll region to exclude bottom line for status bar
+            write!(out, "\x1b[1;{}r", rows - 1)?;
+            // Move cursor to top
+            execute!(out, MoveToRow(0), MoveToColumn(0))?;
+            out.flush()?;
+        }
+
+        Ok(Self { is_tty, rows, cols })
+    }
+
+    /// Print welcome message.
+    pub fn print_welcome(&self) -> Result<()> {
+        if self.is_tty {
+            let mut out = stdout();
+            execute!(
+                out,
+                SetForegroundColor(Color::Cyan),
+                Print("Neuraphage REPL"),
+                ResetColor,
+                Print("\r\n")
+            )?;
+            execute!(
+                out,
+                Print("Type a message to start, or "),
+                SetForegroundColor(Color::Yellow),
+                Print("/help"),
+                ResetColor,
+                Print(" for help\r\n\r\n")
+            )?;
+            out.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Print the input prompt.
+    pub fn print_prompt(&self) -> Result<()> {
+        if self.is_tty {
+            let mut out = stdout();
+            execute!(out, SetForegroundColor(Color::Cyan), Print("> "), ResetColor)?;
+            out.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Leave the REPL screen (restore original terminal).
+    pub fn leave(&mut self) -> Result<()> {
+        if self.is_tty && ALT_SCREEN_ACTIVE.load(Ordering::SeqCst) {
+            let mut out = stdout();
+            // Reset scroll region
+            write!(out, "\x1b[r")?;
+            // Leave alternate screen buffer
+            execute!(out, LeaveAlternateScreen)?;
+            out.flush()?;
+            ALT_SCREEN_ACTIVE.store(false, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    /// Get terminal dimensions.
+    pub fn size(&self) -> (u16, u16) {
+        (self.cols, self.rows)
+    }
+}
+
+impl Drop for ReplScreen {
+    fn drop(&mut self) {
+        let _ = self.leave();
+    }
 }
 
 /// Braille spinner frames for animated activity indicator.
@@ -139,8 +246,9 @@ pub struct ReplDisplay {
 }
 
 impl ReplDisplay {
-    /// Create a new display with scroll region.
-    /// If `prompt` is provided, it will be displayed at the top as "You: {prompt}".
+    /// Create a new display for streaming.
+    /// Only enables raw mode - alternate screen is managed by ReplScreen.
+    /// If `prompt` is provided, it will be displayed as "You: {prompt}".
     pub fn new_with_prompt(prompt: Option<&str>) -> Result<Self> {
         let is_tty = stdout().is_terminal();
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
@@ -151,14 +259,8 @@ impl ReplDisplay {
             RAW_MODE_ACTIVE.store(true, Ordering::SeqCst);
 
             let mut out = stdout();
-            // Enter alternate screen buffer (like vim, htop, etc.)
-            execute!(out, EnterAlternateScreen)?;
-            // Set scroll region to exclude bottom line for status bar
-            write!(out, "\x1b[1;{}r", rows - 1)?;
-            // Move cursor to top
-            execute!(out, MoveToRow(0), MoveToColumn(0))?;
 
-            // Display user's prompt at the top if provided
+            // Display user's prompt if provided
             if let Some(p) = prompt {
                 // Truncate long prompts to fit on screen
                 let max_len = (cols as usize).saturating_sub(10);
@@ -200,7 +302,7 @@ impl ReplDisplay {
         Ok(display)
     }
 
-    /// Create a new display with scroll region (no initial prompt).
+    /// Create a new display for streaming (no initial prompt).
     pub fn new() -> Result<Self> {
         Self::new_with_prompt(None)
     }
@@ -293,16 +395,9 @@ impl ReplDisplay {
         Ok(())
     }
 
-    /// Cleanup: leave alternate screen and restore terminal.
+    /// Cleanup: disable raw mode (alternate screen is managed by ReplScreen).
     pub fn cleanup(&mut self) -> Result<()> {
         if self.raw_mode_enabled {
-            let mut out = stdout();
-            // Reset scroll region
-            write!(out, "\x1b[r")?;
-            // Leave alternate screen buffer - restores original terminal
-            execute!(out, LeaveAlternateScreen)?;
-            out.flush()?;
-
             disable_raw_mode()?;
             self.raw_mode_enabled = false;
             RAW_MODE_ACTIVE.store(false, Ordering::SeqCst);
@@ -314,7 +409,6 @@ impl ReplDisplay {
 impl Drop for ReplDisplay {
     fn drop(&mut self) {
         if self.raw_mode_enabled {
-            let _ = execute!(stdout(), LeaveAlternateScreen);
             let _ = disable_raw_mode();
             RAW_MODE_ACTIVE.store(false, Ordering::SeqCst);
         }

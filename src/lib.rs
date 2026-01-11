@@ -48,7 +48,7 @@ pub use executor::{ExecutionEvent, ExecutionResult, ExecutionStatus, ExecutorCon
 
 // Re-export REPL types
 pub use repl::{Repl, ReplInput, Session};
-pub use repl_display::{Activity, ReplDisplay, StatusState};
+pub use repl_display::{Activity, ReplDisplay, ReplScreen, StatusState};
 
 // Re-export safety types
 pub use safety::{SafetyCheckResult, SafetyChecker, SafetyConfig};

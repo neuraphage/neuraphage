@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::daemon::{DaemonClient, DaemonRequest, DaemonResponse, ExecutionEventDto, ExecutionStatusDto};
 use crate::error::Result;
-use crate::repl_display::{Activity, ReplDisplay, StatusState};
+use crate::repl_display::{Activity, ReplDisplay, ReplScreen, StatusState};
 use crate::task::TaskId;
 
 /// A persistent session for REPL mode.
@@ -137,12 +137,13 @@ impl Repl {
 
     /// Run the REPL loop.
     pub async fn run(&mut self) -> Result<()> {
-        self.print_welcome();
+        // Enter alternate screen for the entire REPL session
+        let mut screen = ReplScreen::enter()?;
+        screen.print_welcome()?;
 
         loop {
             // Read input
-            print!("{} ", ">".cyan());
-            std::io::stdout().flush().ok();
+            screen.print_prompt()?;
 
             let stdin = std::io::stdin();
             let mut input = String::new();
@@ -167,18 +168,12 @@ impl Repl {
             }
         }
 
-        // Save session on exit
+        // Save session and leave alternate screen on exit
         self.session.save().ok();
-        println!("\n{} Session saved", "✓".green());
+        screen.leave()?;
+        println!("{} Session saved", "✓".green());
 
         Ok(())
-    }
-
-    fn print_welcome(&self) {
-        println!();
-        println!("{}", "Neuraphage REPL".cyan().bold());
-        println!("Type a message to start, or {} for help", "/help".yellow());
-        println!();
     }
 
     /// Handle a slash command. Returns false if REPL should exit.
