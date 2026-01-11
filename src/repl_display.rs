@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use crossterm::cursor::{MoveToColumn, MoveToRow, RestorePosition, SavePosition};
 use crossterm::execute;
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
-use crossterm::terminal::{self, Clear, ClearType, disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::{
+    self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 
 use crate::error::Result;
 
@@ -23,12 +25,8 @@ fn install_panic_hook() {
     let original_hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic_info| {
         if RAW_MODE_ACTIVE.load(Ordering::SeqCst) {
-            // Reset scroll region and disable raw mode
-            let _ = execute!(
-                stdout(),
-                Print("\x1b[r"), // Reset scroll region
-                ResetColor
-            );
+            // Leave alternate screen and disable raw mode
+            let _ = execute!(stdout(), LeaveAlternateScreen, ResetColor);
             let _ = disable_raw_mode();
             RAW_MODE_ACTIVE.store(false, Ordering::SeqCst);
         }
@@ -152,10 +150,11 @@ impl ReplDisplay {
             RAW_MODE_ACTIVE.store(true, Ordering::SeqCst);
 
             let mut out = stdout();
-            // Set scroll region to exclude bottom line
-            // ESC [ top ; bottom r
+            // Enter alternate screen buffer (like vim, htop, etc.)
+            execute!(out, EnterAlternateScreen)?;
+            // Set scroll region to exclude bottom line for status bar
             write!(out, "\x1b[1;{}r", rows - 1)?;
-            // Move cursor to top of scroll region
+            // Move cursor to top
             execute!(out, MoveToRow(0), MoveToColumn(0))?;
             out.flush()?;
         }
@@ -268,15 +267,14 @@ impl ReplDisplay {
         Ok(())
     }
 
-    /// Cleanup: reset scroll region and restore terminal.
+    /// Cleanup: leave alternate screen and restore terminal.
     pub fn cleanup(&mut self) -> Result<()> {
         if self.raw_mode_enabled {
             let mut out = stdout();
-            // Reset scroll region to full terminal
+            // Reset scroll region
             write!(out, "\x1b[r")?;
-            // Move to bottom and print newline
-            execute!(out, MoveToRow(self.rows - 1), MoveToColumn(0))?;
-            write!(out, "\r\n")?;
+            // Leave alternate screen buffer - restores original terminal
+            execute!(out, LeaveAlternateScreen)?;
             out.flush()?;
 
             disable_raw_mode()?;
@@ -290,7 +288,7 @@ impl ReplDisplay {
 impl Drop for ReplDisplay {
     fn drop(&mut self) {
         if self.raw_mode_enabled {
-            let _ = execute!(stdout(), Print("\x1b[r")); // Reset scroll region
+            let _ = execute!(stdout(), LeaveAlternateScreen);
             let _ = disable_raw_mode();
             RAW_MODE_ACTIVE.store(false, Ordering::SeqCst);
         }
