@@ -10,6 +10,7 @@ pub mod daemon;
 pub mod error;
 pub mod executor;
 pub mod personas;
+pub mod repl;
 pub mod task;
 pub mod task_manager;
 pub mod ui;
@@ -41,3 +42,6 @@ pub use personas::{TaskSnapshot, WatchResult, Watcher, WatcherConfig, WatcherRec
 
 // Re-export executor types
 pub use executor::{ExecutionEvent, ExecutionResult, ExecutionStatus, ExecutorConfig, TaskExecutor};
+
+// Re-export REPL types
+pub use repl::{Repl, ReplInput, Session};

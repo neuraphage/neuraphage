@@ -16,6 +16,7 @@ use neuraphage::config::Config;
 use neuraphage::daemon::{
     Daemon, DaemonClient, DaemonRequest, DaemonResponse, ExecutionEventDto, ExecutionStatusDto, is_daemon_running,
 };
+use neuraphage::repl::Repl;
 
 fn setup_logging() -> Result<()> {
     let log_dir = dirs::data_local_dir()
@@ -91,7 +92,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             unreachable!("Background daemon should be handled before tokio starts")
         }
         Some(cmd) => run_client_command(&config, cmd).await,
-        None => show_status(&config).await,
+        None => run_repl(&config).await,
     }
 }
 
@@ -542,21 +543,21 @@ fn handle_execution_event(event: &ExecutionEventDto) {
     }
 }
 
-async fn show_status(config: &Config) -> Result<()> {
+async fn run_repl(config: &Config) -> Result<()> {
     let daemon_config = config.to_daemon_config();
 
-    if is_daemon_running(&daemon_config) {
-        println!("{} Daemon is running", "✓".green());
-
-        // Try to get stats
-        if let Ok(mut client) = DaemonClient::connect(&daemon_config).await {
-            let response = client.request(DaemonRequest::TaskCounts).await?;
-            handle_counts_response(response);
-        }
-    } else {
+    // Check if daemon is running
+    if !is_daemon_running(&daemon_config) {
         println!("{} Daemon is not running", "○".yellow());
         println!("Start with: {} daemon", "np".cyan());
+        return Ok(());
     }
+
+    // Connect and start REPL
+    let client = DaemonClient::connect(&daemon_config).await?;
+    let working_dir = std::env::current_dir().unwrap_or_default();
+    let mut repl = Repl::new(client, working_dir);
+    repl.run().await?;
 
     Ok(())
 }
