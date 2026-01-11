@@ -4,6 +4,7 @@
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use colored::*;
@@ -12,6 +13,7 @@ use uuid::Uuid;
 
 use crate::daemon::{DaemonClient, DaemonRequest, DaemonResponse, ExecutionEventDto, ExecutionStatusDto};
 use crate::error::Result;
+use crate::repl_display::{Activity, ReplDisplay, StatusState};
 use crate::task::TaskId;
 
 /// A persistent session for REPL mode.
@@ -309,129 +311,114 @@ impl Repl {
     }
 
     /// Handle a single execution event, updating display state.
-    fn handle_event(event: &ExecutionEventDto, mid_line: &mut bool, should_break: &mut bool) {
+    fn handle_event(
+        event: &ExecutionEventDto,
+        display: &mut ReplDisplay,
+        status: &mut StatusState,
+        should_break: &mut bool,
+    ) {
         match event {
             ExecutionEventDto::IterationComplete {
                 iteration,
                 tokens_used,
                 cost,
             } => {
-                // Don't interrupt streaming text with status updates
-                // Only show status when not actively streaming
-                if !*mid_line {
-                    print!(
-                        "\r{} Iteration {} | Tokens: {} | Cost: ${:.4}   ",
-                        "●".green(),
-                        iteration,
-                        tokens_used,
-                        cost
-                    );
-                    std::io::stdout().flush().ok();
-                }
+                status.iteration = *iteration;
+                status.tokens_used = *tokens_used;
+                status.cost = *cost;
+                status.activity = Activity::Streaming;
+                display.update_status(status.clone()).ok();
             }
             ExecutionEventDto::LlmResponse { content } => {
-                if *mid_line {
-                    println!();
-                    *mid_line = false;
-                }
-                println!();
-                println!("{}", content);
+                display.println("").ok();
+                display.println(content).ok();
             }
             ExecutionEventDto::ToolCalled { name, result } => {
-                if *mid_line {
-                    println!();
-                    *mid_line = false;
-                }
-                println!();
-                println!("{} {}", "→".blue(), name.cyan());
-                let display = if result.len() > 200 {
+                display.println("").ok();
+                display.println(&format!("{} {}", "→".blue(), name.cyan())).ok();
+                let truncated = if result.len() > 200 {
                     format!("{}...", &result[..200])
                 } else {
                     result.clone()
                 };
-                println!("  {}", display.dimmed());
+                display.println(&format!("  {}", truncated.dimmed())).ok();
             }
             ExecutionEventDto::Completed { reason } => {
-                if *mid_line {
-                    println!();
-                }
-                println!();
-                println!("{} {}", "✓".green(), reason);
+                status.activity = Activity::Idle;
+                display.update_status(status.clone()).ok();
+                display.println("").ok();
+                display.println(&format!("{} {}", "✓".green(), reason)).ok();
+                display.print_summary().ok();
                 *should_break = true;
             }
             ExecutionEventDto::Failed { error } => {
-                if *mid_line {
-                    println!();
-                }
-                println!();
-                println!("{} {}", "✗".red(), error);
+                status.activity = Activity::Idle;
+                display.update_status(status.clone()).ok();
+                display.println("").ok();
+                display.println(&format!("{} {}", "✗".red(), error)).ok();
+                display.print_summary().ok();
                 *should_break = true;
             }
             ExecutionEventDto::TextDelta { content } => {
-                // If this is the first text after a status line, go to a new line
-                if !*mid_line {
-                    println!();
-                }
-                // Print streaming text immediately without newline
-                print!("{}", content);
-                std::io::stdout().flush().ok();
-                *mid_line = true;
+                status.activity = Activity::Streaming;
+                display.print_content(content).ok();
             }
             ExecutionEventDto::ActivityChanged { activity } => {
                 use crate::daemon::ActivityDto;
-                // Tool execution activities should show (they naturally follow streaming)
                 match activity {
                     ActivityDto::ExecutingTool { name } => {
-                        if *mid_line {
-                            println!();
-                            *mid_line = false;
-                        }
-                        println!("{} Running {}...", "⚙".blue(), name.cyan());
+                        status.activity = Activity::ExecutingTool(name.clone());
+                        display.update_status(status.clone()).ok();
+                        display
+                            .println(&format!("{} Running {}...", "⚙".blue(), name.cyan()))
+                            .ok();
                     }
                     ActivityDto::WaitingForTool { name } => {
-                        if *mid_line {
-                            println!();
-                            *mid_line = false;
-                        }
-                        println!("{} Waiting for {}...", "⏳".yellow(), name);
+                        status.activity = Activity::WaitingForUser;
+                        display.update_status(status.clone()).ok();
+                        display
+                            .println(&format!("{} Waiting for {}...", "⏳".yellow(), name))
+                            .ok();
                     }
-                    // Only show Thinking/Streaming when not already mid-output
                     ActivityDto::Thinking => {
-                        if !*mid_line {
-                            print!("\r{} Thinking...   ", "●".blue());
-                            std::io::stdout().flush().ok();
-                        }
+                        status.activity = Activity::Thinking;
+                        display.update_status(status.clone()).ok();
                     }
                     ActivityDto::Streaming => {
-                        // Don't show "Writing..." - the streaming text speaks for itself
+                        status.activity = Activity::Streaming;
+                        display.update_status(status.clone()).ok();
                     }
-                    ActivityDto::Idle => {}
+                    ActivityDto::Idle => {
+                        status.activity = Activity::Idle;
+                        display.update_status(status.clone()).ok();
+                    }
                 }
             }
             ExecutionEventDto::ToolStarted { name } => {
-                if *mid_line {
-                    println!();
-                    *mid_line = false;
-                }
-                println!("{} {}...", "⚙".blue(), name.cyan());
+                status.activity = Activity::ExecutingTool(name.clone());
+                display.update_status(status.clone()).ok();
+                display.println(&format!("{} {}...", "⚙".blue(), name.cyan())).ok();
             }
             ExecutionEventDto::ToolCompleted { name, result } => {
-                // Display truncated result
-                let display = if result.len() > 200 {
+                let truncated = if result.len() > 200 {
                     format!("{}...", &result[..200])
                 } else {
                     result.clone()
                 };
-                println!("  {} {}", "✓".green(), name);
-                println!("  {}", display.dimmed());
+                display.println(&format!("  {} {}", "✓".green(), name)).ok();
+                display.println(&format!("  {}", truncated.dimmed())).ok();
             }
             _ => {}
         }
     }
 
     async fn wait_for_task(&mut self, task_id: &str) -> Result<()> {
-        println!();
-        let mut mid_line = false; // Track if we're in the middle of streaming output
+        // Create the display - enters raw mode if TTY
+        let mut display = ReplDisplay::new()?;
+        let mut status = StatusState {
+            task_started: Some(Instant::now()),
+            ..Default::default()
+        };
         let mut should_break = false;
 
         loop {
@@ -441,78 +428,89 @@ impl Repl {
             let response = self.client.request(request).await?;
 
             match response {
-                DaemonResponse::ExecutionStatusResponse { status, .. } => match status {
-                    ExecutionStatusDto::Running {
-                        iteration,
-                        tokens_used,
-                        cost,
-                    } => {
-                        print!(
-                            "\r{} Iteration {} | Tokens: {} | Cost: ${:.4}   ",
-                            "●".green(),
+                DaemonResponse::ExecutionStatusResponse {
+                    status: exec_status, ..
+                } => {
+                    match exec_status {
+                        ExecutionStatusDto::Running {
                             iteration,
                             tokens_used,
-                            cost
-                        );
-                        std::io::stdout().flush().ok();
-                    }
-                    ExecutionStatusDto::WaitingForUser { prompt } => {
-                        println!();
-                        println!("{} {}", "?".yellow(), prompt);
-                        print!("{} ", ">".cyan());
-                        std::io::stdout().flush().ok();
+                            cost,
+                        } => {
+                            status.iteration = iteration;
+                            status.tokens_used = tokens_used;
+                            status.cost = cost;
+                            display.update_status(status.clone())?;
+                        }
+                        ExecutionStatusDto::WaitingForUser { prompt } => {
+                            // Need to cleanup display to read user input
+                            display.cleanup()?;
+                            println!();
+                            println!("{} {}", "?".yellow(), prompt);
+                            print!("{} ", ">".cyan());
+                            std::io::stdout().flush().ok();
 
-                        let stdin = std::io::stdin();
-                        let mut input = String::new();
-                        if stdin.lock().read_line(&mut input).is_ok() {
-                            let input = input.trim().to_string();
-                            if !input.is_empty() {
-                                let request = DaemonRequest::ProvideInput {
-                                    id: task_id.to_string(),
-                                    input,
-                                };
-                                self.client.request(request).await?;
+                            let stdin = std::io::stdin();
+                            let mut input = String::new();
+                            if stdin.lock().read_line(&mut input).is_ok() {
+                                let input = input.trim().to_string();
+                                if !input.is_empty() {
+                                    let request = DaemonRequest::ProvideInput {
+                                        id: task_id.to_string(),
+                                        input,
+                                    };
+                                    self.client.request(request).await?;
+                                }
                             }
+                            // Re-create display for continued execution
+                            display = ReplDisplay::new()?;
+                        }
+                        ExecutionStatusDto::Completed { reason } => {
+                            display.cleanup()?;
+                            println!();
+                            println!("{} {}", "✓".green(), reason);
+                            break;
+                        }
+                        ExecutionStatusDto::Failed { error } => {
+                            display.cleanup()?;
+                            println!();
+                            println!("{} {}", "✗".red(), error);
+                            break;
+                        }
+                        ExecutionStatusDto::Cancelled => {
+                            display.cleanup()?;
+                            println!();
+                            println!("{} Task cancelled", "⊘".yellow());
+                            break;
+                        }
+                        ExecutionStatusDto::NotRunning => {
+                            display.cleanup()?;
+                            break;
                         }
                     }
-                    ExecutionStatusDto::Completed { reason } => {
-                        println!();
-                        println!("{} {}", "✓".green(), reason);
-                        break;
-                    }
-                    ExecutionStatusDto::Failed { error } => {
-                        println!();
-                        println!("{} {}", "✗".red(), error);
-                        break;
-                    }
-                    ExecutionStatusDto::Cancelled => {
-                        println!();
-                        println!("{} Task cancelled", "⊘".yellow());
-                        break;
-                    }
-                    ExecutionStatusDto::NotRunning => {
-                        break;
-                    }
-                },
+                }
                 DaemonResponse::ExecutionUpdate { event, .. } => {
-                    Self::handle_event(&event, &mut mid_line, &mut should_break);
+                    Self::handle_event(&event, &mut display, &mut status, &mut should_break);
                     if should_break {
+                        display.cleanup()?;
                         break;
                     }
                 }
                 DaemonResponse::ExecutionEvents { events, .. } => {
                     // Handle multiple events from the buffer
                     for event in events {
-                        Self::handle_event(&event, &mut mid_line, &mut should_break);
+                        Self::handle_event(&event, &mut display, &mut status, &mut should_break);
                         if should_break {
                             break;
                         }
                     }
                     if should_break {
+                        display.cleanup()?;
                         break;
                     }
                 }
                 DaemonResponse::Error { message } => {
+                    display.cleanup()?;
                     println!("{} {}", "✗".red(), message);
                     break;
                 }
