@@ -25,6 +25,16 @@ impl TaskManager {
         Ok(Self { store })
     }
 
+    /// Get the underlying engram store.
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
+    /// Get mutable access to the underlying engram store.
+    pub fn store_mut(&mut self) -> &mut Store {
+        &mut self.store
+    }
+
     /// Create a new task.
     pub fn create_task(
         &mut self,

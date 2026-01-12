@@ -454,8 +454,17 @@ impl Daemon {
             TaskManager::init(&config.data_path)?
         };
 
-        // Initialize event bus
-        let event_bus = Arc::new(EventBus::new());
+        // Open a separate engram store for event persistence
+        // (EventBus needs its own connection to avoid lock contention with TaskManager)
+        let event_store = if config.data_path.join(".engram").exists() {
+            engram::Store::open(&config.data_path)?
+        } else {
+            engram::Store::init(&config.data_path)?
+        };
+        let event_store = Arc::new(std::sync::Mutex::new(event_store));
+
+        // Initialize event bus with engram persistence
+        let event_bus = Arc::new(EventBus::with_engram(event_store));
 
         // Initialize supervised executor
         let supervised_config = SupervisedExecutorConfig {

@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Task graph persistence
-engram = { git = "ssh://git@github.com/neuraphage/engram" }
+engram = { path = "../engram" }
 
 # CLI and config
 clap = { version = "4", features = ["derive"] }

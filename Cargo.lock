@@ -540,8 +540,7 @@ dependencies = [
 
 [[package]]
 name = "engram"
-version = "0.1.1"
-source = "git+ssh://git@github.com/neuraphage/engram#08f81f3a4cb370a68aaba6024b1fce5f16cf4e96"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "clap",

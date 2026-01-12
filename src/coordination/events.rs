@@ -63,6 +63,72 @@ pub enum EventKind {
     Custom(String),
 }
 
+impl EventKind {
+    /// Returns true if this event kind should be persisted to engram.
+    /// Durable events form the audit trail for debugging.
+    pub fn is_durable(&self) -> bool {
+        match self {
+            // Task lifecycle events - always persist
+            EventKind::TaskStarted => true,
+            EventKind::TaskCompleted => true,
+            EventKind::TaskFailed => true,
+            EventKind::TaskCancelled => true,
+
+            // Coordination events - always persist
+            EventKind::MainUpdated => true,
+            EventKind::RebaseRequired => true,
+            EventKind::RebaseCompleted => true,
+            EventKind::RebaseConflict => true,
+
+            // Supervision events - persist for debugging
+            EventKind::NudgeSent => true,
+            EventKind::SyncRelayed => true,
+            EventKind::TaskPaused => true,
+            EventKind::SupervisionDegraded => true,
+            EventKind::SupervisionRecovered => true,
+
+            // Resource events - persist
+            EventKind::LearningExtracted => true,
+            EventKind::LockAcquired => true,
+            EventKind::LockReleased => true,
+
+            // Ephemeral events - do not persist
+            EventKind::TaskWaitingForUser => false, // Transient state
+            EventKind::FileModified => false,       // High volume, can reconstruct from git
+            EventKind::RateLimitReached => false,   // Operational, not coordination
+
+            // Custom events - don't persist by default
+            EventKind::Custom(_) => false,
+        }
+    }
+
+    /// Convert to string representation for storage.
+    pub fn to_string(&self) -> String {
+        match self {
+            EventKind::TaskStarted => "task_started".to_string(),
+            EventKind::TaskCompleted => "task_completed".to_string(),
+            EventKind::TaskFailed => "task_failed".to_string(),
+            EventKind::TaskCancelled => "task_cancelled".to_string(),
+            EventKind::TaskWaitingForUser => "task_waiting_for_user".to_string(),
+            EventKind::FileModified => "file_modified".to_string(),
+            EventKind::LearningExtracted => "learning_extracted".to_string(),
+            EventKind::LockAcquired => "lock_acquired".to_string(),
+            EventKind::LockReleased => "lock_released".to_string(),
+            EventKind::RateLimitReached => "rate_limit_reached".to_string(),
+            EventKind::NudgeSent => "nudge_sent".to_string(),
+            EventKind::SyncRelayed => "sync_relayed".to_string(),
+            EventKind::TaskPaused => "task_paused".to_string(),
+            EventKind::SupervisionDegraded => "supervision_degraded".to_string(),
+            EventKind::SupervisionRecovered => "supervision_recovered".to_string(),
+            EventKind::MainUpdated => "main_updated".to_string(),
+            EventKind::RebaseRequired => "rebase_required".to_string(),
+            EventKind::RebaseCompleted => "rebase_completed".to_string(),
+            EventKind::RebaseConflict => "rebase_conflict".to_string(),
+            EventKind::Custom(s) => format!("custom:{}", s),
+        }
+    }
+}
+
 /// An event in the system.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
@@ -184,6 +250,8 @@ pub struct EventBus {
     max_history: usize,
     /// Event counts by kind.
     counts: Arc<Mutex<HashMap<EventKind, usize>>>,
+    /// Optional engram store for persisting durable events.
+    engram_store: Option<Arc<std::sync::Mutex<engram::Store>>>,
 }
 
 impl EventBus {
@@ -195,6 +263,7 @@ impl EventBus {
             history: Arc::new(Mutex::new(Vec::new())),
             max_history: 1000,
             counts: Arc::new(Mutex::new(HashMap::new())),
+            engram_store: None,
         }
     }
 
@@ -206,11 +275,41 @@ impl EventBus {
             history: Arc::new(Mutex::new(Vec::new())),
             max_history: size,
             counts: Arc::new(Mutex::new(HashMap::new())),
+            engram_store: None,
         }
+    }
+
+    /// Create an event bus that persists durable events to engram.
+    pub fn with_engram(store: Arc<std::sync::Mutex<engram::Store>>) -> Self {
+        let (sender, _) = broadcast::channel(1024);
+        Self {
+            sender,
+            history: Arc::new(Mutex::new(Vec::new())),
+            max_history: 1000,
+            counts: Arc::new(Mutex::new(HashMap::new())),
+            engram_store: Some(store),
+        }
+    }
+
+    /// Set the engram store for event persistence.
+    pub fn set_engram_store(&mut self, store: Arc<std::sync::Mutex<engram::Store>>) {
+        self.engram_store = Some(store);
     }
 
     /// Publish an event.
     pub async fn publish(&self, event: Event) {
+        // Persist durable events to engram (fire-and-forget)
+        if let Some(store) = &self.engram_store {
+            if event.kind.is_durable() {
+                let engram_event = self.to_engram_event(&event);
+                if let Ok(mut s) = store.lock() {
+                    if let Err(e) = s.record_event_raw(&engram_event) {
+                        log::warn!("Failed to persist event to engram: {}", e);
+                    }
+                }
+            }
+        }
+
         // Add to history
         {
             let mut history = self.history.lock().await;
@@ -228,6 +327,18 @@ impl EventBus {
 
         // Broadcast (ignore if no receivers)
         let _ = self.sender.send(event);
+    }
+
+    /// Convert an EventBus event to an engram Event.
+    fn to_engram_event(&self, event: &Event) -> engram::Event {
+        engram::Event {
+            id: format!("eg-evt-{}", &event.id[..10.min(event.id.len())]),
+            kind: event.kind.to_string(),
+            source_task: event.source_task.as_ref().map(|t| t.0.clone()),
+            target_task: event.target_task.as_ref().map(|t| t.0.clone()),
+            payload: event.payload.clone(),
+            timestamp: event.timestamp,
+        }
     }
 
     /// Subscribe to all events.
