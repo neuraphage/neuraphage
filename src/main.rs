@@ -375,6 +375,11 @@ async fn handle_cost_command(config: &Config, cmd: CostCommand) -> Result<()> {
 }
 
 async fn run_client_command(config: &Config, command: Command) -> Result<()> {
+    // Handle commands that don't need the daemon first
+    if let Command::Cost(cost_cmd) = command {
+        return handle_cost_command(config, cost_cmd).await;
+    }
+
     let daemon_config = config.to_daemon_config();
 
     // Check if daemon is running, start if needed
@@ -733,10 +738,7 @@ async fn run_client_command(config: &Config, command: Command) -> Result<()> {
                 }
             }
         },
-        Command::Cost(cost_cmd) => {
-            // Cost commands don't need the daemon - they work directly with the ledger file
-            handle_cost_command(config, cost_cmd).await?;
-        }
+        Command::Cost(_) => unreachable!("Cost commands handled before daemon check"),
     }
 
     Ok(())
