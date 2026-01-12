@@ -114,6 +114,68 @@ pub enum ConnectionStatus {
     Reconnecting(u8),
 }
 
+/// Attention level for workstreams based on idle time and status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum AttentionLevel {
+    /// No attention needed - task is progressing normally.
+    #[default]
+    None,
+    /// Subtle indicator - 30s idle for running tasks.
+    Subtle,
+    /// Warning - 60s idle, shown with yellow highlight.
+    Warning,
+    /// Urgent - 2min idle or WaitingForUser, pulsing animation.
+    Urgent,
+    /// Critical - user input required or task blocked.
+    Critical,
+}
+
+impl AttentionLevel {
+    /// Get attention level from idle duration and status.
+    pub fn from_state(status: TaskStatus, idle: Duration, needs_attention: bool) -> Self {
+        // Critical states override idle time
+        if status == TaskStatus::WaitingForUser || needs_attention {
+            return AttentionLevel::Critical;
+        }
+        if status == TaskStatus::Blocked {
+            return AttentionLevel::Urgent;
+        }
+
+        // Only running tasks have idle-based attention
+        if status != TaskStatus::Running {
+            return AttentionLevel::None;
+        }
+
+        // Idle time thresholds
+        let secs = idle.as_secs();
+        if secs >= 120 {
+            AttentionLevel::Urgent
+        } else if secs >= 60 {
+            AttentionLevel::Warning
+        } else if secs >= 30 {
+            AttentionLevel::Subtle
+        } else {
+            AttentionLevel::None
+        }
+    }
+
+    /// Get the attention color.
+    pub fn color(&self) -> Color {
+        match self {
+            AttentionLevel::None => Color::Reset,
+            AttentionLevel::Subtle => Color::Rgb(100, 100, 100),
+            AttentionLevel::Warning => Color::Rgb(255, 215, 0), // Gold
+            AttentionLevel::Urgent => Color::Rgb(255, 140, 0),  // Dark orange
+            AttentionLevel::Critical => Color::Rgb(255, 69, 0), // Red-orange
+        }
+    }
+
+    /// Whether this attention level should pulse.
+    pub fn should_pulse(&self) -> bool {
+        matches!(self, AttentionLevel::Urgent | AttentionLevel::Critical)
+    }
+}
+
 /// Budget status for display.
 #[derive(Debug, Clone, Default)]
 pub struct BudgetStatus {
@@ -193,6 +255,40 @@ impl TimelineEvent {
     pub fn with_importance(mut self, importance: EventImportance) -> Self {
         self.importance = importance;
         self
+    }
+
+    /// Create timeline event from coordination event kind.
+    pub fn from_event_kind(kind: &crate::coordination::EventKind, source: Option<&TaskId>) -> Self {
+        use crate::coordination::EventKind;
+
+        let (icon, description, importance) = match kind {
+            EventKind::TaskStarted => ('●', "Task started", EventImportance::Normal),
+            EventKind::TaskCompleted => ('✓', "Task completed", EventImportance::Normal),
+            EventKind::TaskFailed => ('✗', "Task failed", EventImportance::High),
+            EventKind::TaskCancelled => ('⊘', "Task cancelled", EventImportance::Normal),
+            EventKind::TaskPaused => ('◑', "Task paused", EventImportance::Normal),
+            EventKind::TaskWaitingForUser => ('?', "Waiting for user", EventImportance::Critical),
+            EventKind::MainUpdated => ('↑', "Main branch updated", EventImportance::Normal),
+            EventKind::RebaseRequired => ('↻', "Rebase required", EventImportance::High),
+            EventKind::RebaseCompleted => ('✓', "Rebase completed", EventImportance::Normal),
+            EventKind::RebaseConflict => ('⚠', "Rebase conflict", EventImportance::Critical),
+            EventKind::NudgeSent => ('→', "Nudge sent", EventImportance::Low),
+            EventKind::SyncRelayed => ('⚡', "Learning synced", EventImportance::Normal),
+            EventKind::LearningExtracted => ('💡', "Learning extracted", EventImportance::Low),
+            EventKind::LockAcquired => ('🔒', "Lock acquired", EventImportance::Low),
+            EventKind::LockReleased => ('🔓', "Lock released", EventImportance::Low),
+            EventKind::SupervisionDegraded => ('⚠', "Supervision degraded", EventImportance::High),
+            EventKind::SupervisionRecovered => ('✓', "Supervision recovered", EventImportance::Normal),
+            EventKind::RateLimitReached => ('⏱', "Rate limit reached", EventImportance::High),
+            EventKind::FileModified => ('📝', "File modified", EventImportance::Low),
+            EventKind::Custom(msg) => ('•', msg.as_str(), EventImportance::Normal),
+        };
+
+        let mut event = Self::new(icon, description).with_importance(importance);
+        if let Some(task_id) = source {
+            event = event.with_tasks(vec![task_id.clone()]);
+        }
+        event
     }
 }
 
@@ -345,6 +441,11 @@ impl Workstream {
         }
     }
 
+    /// Get the current attention level based on status and idle time.
+    pub fn attention_level(&self) -> AttentionLevel {
+        AttentionLevel::from_state(self.status, self.idle_duration, self.needs_attention)
+    }
+
     /// Get status icon.
     pub fn status_icon(&self) -> &'static str {
         match self.status {
@@ -403,6 +504,8 @@ pub struct ParallelTuiState {
     pub connection_status: ConnectionStatus,
     /// Maximum events in timeline.
     max_timeline_events: usize,
+    /// Frame counter for animations (wraps at 60).
+    frame_counter: u8,
 }
 
 impl Default for ParallelTuiState {
@@ -433,7 +536,25 @@ impl ParallelTuiState {
             sort_order: settings.default_sort.into(),
             connection_status: ConnectionStatus::Connected,
             max_timeline_events: settings.max_timeline_events,
+            frame_counter: 0,
         }
+    }
+
+    /// Advance the frame counter (call once per frame for animations).
+    pub fn tick(&mut self) {
+        self.frame_counter = self.frame_counter.wrapping_add(1) % 60;
+    }
+
+    /// Get current pulse intensity (0.0-1.0) for pulsing animations.
+    /// Uses a sine wave over 60 frames for smooth pulsing.
+    pub fn pulse_intensity(&self) -> f32 {
+        let t = (self.frame_counter as f32) / 60.0 * std::f32::consts::TAU;
+        (t.sin() + 1.0) / 2.0
+    }
+
+    /// Check if pulse is in the "on" phase (intensity > 0.5).
+    pub fn pulse_on(&self) -> bool {
+        self.pulse_intensity() > 0.5
     }
 
     /// Get the current layout as a config type (for persistence).
@@ -867,23 +988,45 @@ impl ParallelTuiApp {
     /// Render the workstream list (sidebar).
     fn render_workstream_list(&self, frame: &mut Frame, area: Rect) {
         let filtered = self.state.filtered_workstreams();
+        let pulse_on = self.state.pulse_on();
 
         let items: Vec<ListItem> = filtered
             .iter()
             .enumerate()
             .map(|(i, workstream)| {
+                let attention = workstream.attention_level();
+                let should_show_attention = !attention.should_pulse() || pulse_on;
+
+                // Status icon with color
                 let icon = Span::styled(workstream.status_icon(), Style::default().fg(workstream.status_color()));
                 let index = Span::styled(format!("[{}]", i + 1), Style::default().fg(Color::DarkGray));
-                let name = if workstream.needs_attention {
-                    Span::styled(
-                        &workstream.name,
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                    )
+
+                // Name styling based on attention level
+                let name_style = if should_show_attention && attention >= AttentionLevel::Warning {
+                    Style::default().fg(attention.color()).add_modifier(Modifier::BOLD)
+                } else if attention == AttentionLevel::Subtle {
+                    Style::default().fg(Color::Rgb(200, 200, 200))
                 } else {
-                    Span::raw(&workstream.name)
+                    Style::default()
+                };
+                let name = Span::styled(&workstream.name, name_style);
+
+                // Attention indicator suffix
+                let attention_suffix = if should_show_attention {
+                    match attention {
+                        AttentionLevel::Critical => Span::styled(
+                            " !",
+                            Style::default().fg(attention.color()).add_modifier(Modifier::BOLD),
+                        ),
+                        AttentionLevel::Urgent => Span::styled(" ⚠", Style::default().fg(attention.color())),
+                        AttentionLevel::Warning => Span::styled(" •", Style::default().fg(attention.color())),
+                        _ => Span::raw(""),
+                    }
+                } else {
+                    Span::raw("")
                 };
 
-                let line = Line::from(vec![index, " ".into(), icon, " ".into(), name]);
+                let line = Line::from(vec![index, " ".into(), icon, " ".into(), name, attention_suffix]);
                 ListItem::new(line)
             })
             .collect();
@@ -891,7 +1034,18 @@ impl ParallelTuiApp {
         let mut list_state = ListState::default();
         list_state.select(Some(self.state.primary_focus));
 
-        let title = format!(" Workstreams ({}) ", filtered.len());
+        // Count tasks needing attention
+        let attention_count = filtered
+            .iter()
+            .filter(|w| w.attention_level() >= AttentionLevel::Warning)
+            .count();
+
+        let title = if attention_count > 0 {
+            format!(" Workstreams ({}) [{}!] ", filtered.len(), attention_count)
+        } else {
+            format!(" Workstreams ({}) ", filtered.len())
+        };
+
         let list = List::new(items)
             .block(
                 Block::default()
@@ -1470,5 +1624,127 @@ mod tests {
         assert_eq!(app.state.layout_mode, LayoutMode::Focus);
         assert_eq!(app.state.sort_order, SortOrder::Activity);
         assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn test_attention_level_from_state() {
+        // Running task with no idle time = None
+        assert_eq!(
+            AttentionLevel::from_state(TaskStatus::Running, Duration::ZERO, false),
+            AttentionLevel::None
+        );
+
+        // Running task 30s idle = Subtle
+        assert_eq!(
+            AttentionLevel::from_state(TaskStatus::Running, Duration::from_secs(30), false),
+            AttentionLevel::Subtle
+        );
+
+        // Running task 60s idle = Warning
+        assert_eq!(
+            AttentionLevel::from_state(TaskStatus::Running, Duration::from_secs(60), false),
+            AttentionLevel::Warning
+        );
+
+        // Running task 120s idle = Urgent
+        assert_eq!(
+            AttentionLevel::from_state(TaskStatus::Running, Duration::from_secs(120), false),
+            AttentionLevel::Urgent
+        );
+
+        // WaitingForUser always Critical
+        assert_eq!(
+            AttentionLevel::from_state(TaskStatus::WaitingForUser, Duration::ZERO, false),
+            AttentionLevel::Critical
+        );
+
+        // Blocked = Urgent
+        assert_eq!(
+            AttentionLevel::from_state(TaskStatus::Blocked, Duration::ZERO, false),
+            AttentionLevel::Urgent
+        );
+
+        // needs_attention flag = Critical
+        assert_eq!(
+            AttentionLevel::from_state(TaskStatus::Running, Duration::ZERO, true),
+            AttentionLevel::Critical
+        );
+
+        // Completed tasks don't get attention
+        assert_eq!(
+            AttentionLevel::from_state(TaskStatus::Completed, Duration::from_secs(120), false),
+            AttentionLevel::None
+        );
+    }
+
+    #[test]
+    fn test_attention_level_color_and_pulse() {
+        assert!(!AttentionLevel::None.should_pulse());
+        assert!(!AttentionLevel::Subtle.should_pulse());
+        assert!(!AttentionLevel::Warning.should_pulse());
+        assert!(AttentionLevel::Urgent.should_pulse());
+        assert!(AttentionLevel::Critical.should_pulse());
+
+        // Just check colors don't panic
+        let _ = AttentionLevel::None.color();
+        let _ = AttentionLevel::Warning.color();
+        let _ = AttentionLevel::Critical.color();
+    }
+
+    #[test]
+    fn test_workstream_attention_level() {
+        let mut workstream = test_workstream("task-1", "Test", TaskStatus::Running);
+        assert_eq!(workstream.attention_level(), AttentionLevel::None);
+
+        // Simulate 60s idle
+        workstream.idle_duration = Duration::from_secs(60);
+        assert_eq!(workstream.attention_level(), AttentionLevel::Warning);
+
+        // Change status to WaitingForUser
+        workstream.status = TaskStatus::WaitingForUser;
+        assert_eq!(workstream.attention_level(), AttentionLevel::Critical);
+    }
+
+    #[test]
+    fn test_pulse_animation() {
+        let mut state = ParallelTuiState::new();
+
+        // Tick through frames and verify pulse changes
+        let mut saw_on = false;
+        let mut saw_off = false;
+        for _ in 0..60 {
+            if state.pulse_on() {
+                saw_on = true;
+            } else {
+                saw_off = true;
+            }
+            state.tick();
+        }
+
+        assert!(saw_on, "Pulse should be on at some point");
+        assert!(saw_off, "Pulse should be off at some point");
+    }
+
+    #[test]
+    fn test_timeline_event_from_event_kind() {
+        use crate::coordination::EventKind;
+
+        let event = TimelineEvent::from_event_kind(&EventKind::TaskFailed, None);
+        assert_eq!(event.icon, '✗');
+        assert_eq!(event.importance, EventImportance::High);
+        assert!(event.task_ids.is_empty());
+
+        let task_id = TaskId("test-task".to_string());
+        let event_with_task = TimelineEvent::from_event_kind(&EventKind::TaskStarted, Some(&task_id));
+        assert_eq!(event_with_task.task_ids, vec![task_id]);
+    }
+
+    #[test]
+    fn test_attention_level_ordering() {
+        // Test that attention levels are ordered correctly
+        assert!(AttentionLevel::None < AttentionLevel::Subtle);
+        assert!(AttentionLevel::Subtle < AttentionLevel::Warning);
+        assert!(AttentionLevel::Warning < AttentionLevel::Urgent);
+        assert!(AttentionLevel::Urgent < AttentionLevel::Critical);
     }
 }
