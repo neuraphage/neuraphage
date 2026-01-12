@@ -76,6 +76,12 @@ pub struct DaemonConfig {
     /// Enable supervised execution with Watcher and Syncer.
     #[serde(default = "default_supervision_enabled")]
     pub supervision_enabled: bool,
+    /// Budget settings for cost control.
+    #[serde(default)]
+    pub budget: crate::config::BudgetSettings,
+    /// Model pricing configuration.
+    #[serde(default = "crate::config::default_model_pricing")]
+    pub model_pricing: crate::config::ModelPricingMap,
 }
 
 fn default_supervision_enabled() -> bool {
@@ -93,6 +99,8 @@ impl Default for DaemonConfig {
             pid_path: base.join("neuraphage.pid"),
             data_path: base.clone(),
             supervision_enabled: true,
+            budget: crate::config::BudgetSettings::default(),
+            model_pricing: crate::config::default_model_pricing(),
         }
     }
 }
@@ -105,6 +113,8 @@ impl DaemonConfig {
             pid_path: path.join("neuraphage.pid"),
             data_path: path.to_path_buf(),
             supervision_enabled: true,
+            budget: crate::config::BudgetSettings::default(),
+            model_pricing: crate::config::default_model_pricing(),
         }
     }
 }
@@ -399,6 +409,10 @@ pub struct Daemon {
     #[allow(dead_code)]
     event_bus: Arc<EventBus>,
     merge_queue: Arc<Mutex<MergeQueue>>,
+    /// Cost tracker for budget enforcement.
+    /// Note: Currently used for initialization only; full integration is planned.
+    #[allow(dead_code)]
+    cost_tracker: Arc<crate::cost::CostTracker>,
     shutdown: tokio::sync::broadcast::Sender<()>,
 }
 
@@ -432,6 +446,13 @@ impl Daemon {
         // Initialize merge queue
         let merge_queue = MergeQueue::new();
 
+        // Initialize cost tracker
+        let cost_tracker = Arc::new(crate::cost::CostTracker::new(
+            config.budget.clone(),
+            config.model_pricing.clone(),
+            &config.data_path,
+        )?);
+
         let (shutdown, _) = tokio::sync::broadcast::channel(1);
 
         Ok(Self {
@@ -440,6 +461,7 @@ impl Daemon {
             supervised_executor,
             event_bus,
             merge_queue: Arc::new(Mutex::new(merge_queue)),
+            cost_tracker,
             shutdown,
         })
     }

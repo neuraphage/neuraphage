@@ -117,6 +117,8 @@ impl Config {
             pid_path: self.pid_path(),
             data_path: self.data_dir.clone(),
             supervision_enabled: true,
+            budget: self.budget.clone(),
+            model_pricing: self.model_pricing.clone(),
         }
     }
 }
@@ -242,7 +244,7 @@ pub struct ModelPricing {
 pub type ModelPricingMap = HashMap<String, ModelPricing>;
 
 /// Default model pricing for Claude models.
-fn default_model_pricing() -> ModelPricingMap {
+pub fn default_model_pricing() -> ModelPricingMap {
     let mut m = HashMap::new();
     // Claude 4 Sonnet
     m.insert(
