@@ -280,6 +280,50 @@ pub enum Command {
     /// Manage proactive rebasing against main
     #[command(subcommand)]
     Rebase(RebaseCommand),
+
+    /// View coordination events
+    #[command(subcommand)]
+    Events(EventsCommand),
+}
+
+/// Events tracking commands.
+#[derive(Subcommand)]
+pub enum EventsCommand {
+    /// List recent events
+    List {
+        /// Filter by event kind
+        #[arg(short, long)]
+        kind: Option<String>,
+
+        /// Filter by source task ID
+        #[arg(short, long)]
+        source: Option<String>,
+
+        /// Filter by target task ID
+        #[arg(short = 'T', long)]
+        target: Option<String>,
+
+        /// Maximum number of events to show
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+
+        /// Show events since (ISO 8601 timestamp)
+        #[arg(long)]
+        since: Option<String>,
+    },
+
+    /// Show event counts by kind
+    Counts,
+
+    /// Show events for a specific task
+    Task {
+        /// Task ID
+        id: String,
+
+        /// Maximum number of events to show
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
 }
 
 /// Worktree management commands.
@@ -524,6 +568,60 @@ mod tests {
             assert_eq!(id, "task-123");
         } else {
             panic!("Expected Rebase Trigger command");
+        }
+    }
+
+    #[test]
+    fn test_events_list() {
+        let cli = Cli::parse_from(["np", "events", "list"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Events(EventsCommand::List { limit: 50, .. }))
+        ));
+    }
+
+    #[test]
+    fn test_events_list_with_filters() {
+        let cli = Cli::parse_from([
+            "np",
+            "events",
+            "list",
+            "--kind",
+            "task_started",
+            "--source",
+            "task-123",
+            "--limit",
+            "10",
+        ]);
+        if let Some(Command::Events(EventsCommand::List {
+            kind,
+            source,
+            limit,
+            ..
+        })) = cli.command
+        {
+            assert_eq!(kind, Some("task_started".to_string()));
+            assert_eq!(source, Some("task-123".to_string()));
+            assert_eq!(limit, 10);
+        } else {
+            panic!("Expected Events List command");
+        }
+    }
+
+    #[test]
+    fn test_events_counts() {
+        let cli = Cli::parse_from(["np", "events", "counts"]);
+        assert!(matches!(cli.command, Some(Command::Events(EventsCommand::Counts))));
+    }
+
+    #[test]
+    fn test_events_task() {
+        let cli = Cli::parse_from(["np", "events", "task", "task-123"]);
+        if let Some(Command::Events(EventsCommand::Task { id, limit })) = cli.command {
+            assert_eq!(id, "task-123");
+            assert_eq!(limit, 50);
+        } else {
+            panic!("Expected Events Task command");
         }
     }
 }

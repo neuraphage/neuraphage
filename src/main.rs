@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 mod cli;
 
-use cli::{Cli, Command, CostCommand, DaemonCommand, MergeCommand, RebaseCommand, WorktreeCommand};
+use cli::{Cli, Command, CostCommand, DaemonCommand, EventsCommand, MergeCommand, RebaseCommand, WorktreeCommand};
 use neuraphage::config::Config;
 use neuraphage::daemon::{
     ActivityDto, Daemon, DaemonClient, DaemonRequest, DaemonResponse, ExecutionEventDto, ExecutionStatusDto,
@@ -374,10 +374,125 @@ async fn handle_cost_command(config: &Config, cmd: CostCommand) -> Result<()> {
     Ok(())
 }
 
+/// Handle events tracking commands.
+async fn handle_events_command(config: &Config, cmd: EventsCommand) -> Result<()> {
+    use engram::StoreEventExt;
+
+    // Open engram store directly (events don't need daemon)
+    let store = engram::Store::open(&config.data_dir).context("Failed to open engram store")?;
+
+    match cmd {
+        EventsCommand::List {
+            kind,
+            source,
+            target,
+            limit,
+            since,
+        } => {
+            // Build query using builder pattern
+            let mut query = store.event_query();
+            if let Some(k) = kind {
+                query = query.kind(k);
+            }
+            if let Some(s) = source {
+                query = query.source(s);
+            }
+            if let Some(t) = target {
+                query = query.target(t);
+            }
+            if let Some(since_str) = since {
+                let ts = chrono::DateTime::parse_from_rfc3339(&since_str)
+                    .context("Invalid timestamp format (use ISO 8601, e.g., 2024-01-01T00:00:00Z)")?
+                    .with_timezone(&chrono::Utc);
+                query = query.since(ts);
+            }
+            query = query.limit(limit);
+
+            let events = query.execute().context("Failed to query events")?;
+
+            if events.is_empty() {
+                println!("{}", "No events found".dimmed());
+            } else {
+                println!("{} {} event(s):", "→".blue(), events.len());
+                println!();
+                for event in events {
+                    let source_str = event.source_task.as_deref().unwrap_or("-");
+                    let target_str = event.target_task.as_deref().unwrap_or("-");
+                    let time = event.timestamp.format("%Y-%m-%d %H:%M:%S");
+
+                    println!(
+                        "  {} {} {} → {}",
+                        time.to_string().dimmed(),
+                        event.kind.cyan(),
+                        source_str,
+                        target_str
+                    );
+                    if !event.payload.is_null() {
+                        println!("    {}", event.payload.to_string().dimmed());
+                    }
+                }
+            }
+        }
+
+        EventsCommand::Counts => {
+            let counts = store.event_counts().context("Failed to get event counts")?;
+
+            if counts.total == 0 {
+                println!("{}", "No events recorded".dimmed());
+            } else {
+                println!("{} {} total event(s):", "→".blue(), counts.total);
+                println!();
+
+                // Sort by count descending
+                let mut kinds: Vec<_> = counts.by_kind.iter().collect();
+                kinds.sort_by(|a, b| b.1.cmp(a.1));
+
+                for (kind, count) in kinds {
+                    println!("  {:30} {}", kind.cyan(), count);
+                }
+            }
+        }
+
+        EventsCommand::Task { id, limit } => {
+            let counts = store.task_event_counts(&id).context("Failed to get task event counts")?;
+
+            if counts.total == 0 {
+                println!("{} No events for task {}", "○".yellow(), id.cyan());
+            } else {
+                println!("{} Task {} - {} event(s):", "→".blue(), id.cyan(), counts.total);
+                println!();
+
+                // Show counts by kind
+                let mut kinds: Vec<_> = counts.by_kind.iter().collect();
+                kinds.sort_by(|a, b| b.1.cmp(a.1));
+
+                for (kind, count) in kinds {
+                    println!("  {:30} {}", kind.cyan(), count);
+                }
+
+                // Also show recent events for this task
+                println!();
+                println!("{} Recent events:", "→".blue());
+
+                let events = store.event_query().source(&id).limit(limit).execute()?;
+                for event in events {
+                    let time = event.timestamp.format("%Y-%m-%d %H:%M:%S");
+                    println!("  {} {}", time.to_string().dimmed(), event.kind.cyan());
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn run_client_command(config: &Config, command: Command) -> Result<()> {
     // Handle commands that don't need the daemon first
     if let Command::Cost(cost_cmd) = command {
         return handle_cost_command(config, cost_cmd).await;
+    }
+    if let Command::Events(events_cmd) = command {
+        return handle_events_command(config, events_cmd).await;
     }
 
     let daemon_config = config.to_daemon_config();
@@ -784,6 +899,8 @@ async fn run_client_command(config: &Config, command: Command) -> Result<()> {
                 }
             }
         },
+
+        Command::Events(_) => unreachable!("Events commands handled before daemon check"),
     }
 
     Ok(())
