@@ -23,6 +23,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::config::{TuiLayoutMode, TuiSettings, TuiSortOrder};
+use crate::daemon::{MessageDto, MessageRoleDto};
 use crate::error::Result;
 use crate::notifications::Notification;
 use crate::task::{TaskId, TaskStatus};
@@ -386,6 +387,12 @@ pub struct Workstream {
     pub worktree_path: Option<PathBuf>,
     /// Time since last activity (for stuck detection).
     pub idle_duration: Duration,
+    /// Loaded conversation messages.
+    pub conversation: Vec<MessageDto>,
+    /// Whether conversation has been loaded.
+    pub conversation_loaded: bool,
+    /// Scroll position for conversation view.
+    pub conversation_scroll: usize,
 }
 
 impl Workstream {
@@ -409,6 +416,9 @@ impl Workstream {
             attention_reason: None,
             worktree_path: None,
             idle_duration: Duration::ZERO,
+            conversation: Vec::new(),
+            conversation_loaded: false,
+            conversation_scroll: 0,
         }
     }
 
@@ -465,6 +475,28 @@ impl Workstream {
         if let Ok(duration) = (now - self.last_activity).to_std() {
             self.idle_duration = duration;
         }
+    }
+
+    /// Set the conversation messages for this workstream.
+    pub fn set_conversation(&mut self, messages: Vec<MessageDto>) {
+        self.conversation = messages;
+        self.conversation_loaded = true;
+        self.conversation_scroll = 0;
+    }
+
+    /// Add a message to the conversation (for streaming updates).
+    pub fn add_conversation_message(&mut self, message: MessageDto) {
+        self.conversation.push(message);
+    }
+
+    /// Scroll conversation up.
+    pub fn scroll_conversation_up(&mut self, amount: usize) {
+        self.conversation_scroll = self.conversation_scroll.saturating_sub(amount);
+    }
+
+    /// Scroll conversation down.
+    pub fn scroll_conversation_down(&mut self, amount: usize, max_scroll: usize) {
+        self.conversation_scroll = (self.conversation_scroll + amount).min(max_scroll);
     }
 
     /// Get the current attention level based on status and idle time.
@@ -1570,7 +1602,12 @@ impl ParallelTuiApp {
     ) {
         let (title, border_color) = if let Some(w) = workstream {
             let prefix = if is_primary { "Active" } else { "Secondary" };
-            let title = format!(" {}: {} ", prefix, w.name);
+            let msg_count = if w.conversation_loaded {
+                format!(" ({} msgs)", w.conversation.len())
+            } else {
+                String::new()
+            };
+            let title = format!(" {}: {}{} ", prefix, w.name, msg_count);
             let color = if is_primary { Color::Rgb(0, 191, 255) } else { Color::Rgb(70, 70, 70) };
             (title, color)
         } else {
@@ -1587,24 +1624,52 @@ impl ParallelTuiApp {
         frame.render_widget(block, area);
 
         if let Some(workstream) = workstream {
-            // Render output
-            let output_lines: Vec<Line> = workstream
-                .output
-                .iter()
-                .rev()
-                .take(inner.height as usize)
-                .rev()
-                .map(|line| {
-                    if line.is_error {
-                        Line::styled(&line.text, Style::default().fg(Color::Red))
-                    } else {
-                        Line::raw(&line.text)
-                    }
-                })
-                .collect();
+            // If conversation is loaded, show conversation messages
+            if workstream.conversation_loaded && !workstream.conversation.is_empty() {
+                let content_lines = self.format_conversation(&workstream.conversation, inner.width as usize);
 
-            let paragraph = Paragraph::new(output_lines).wrap(Wrap { trim: false });
-            frame.render_widget(paragraph, inner);
+                // Apply scroll - show from scroll position
+                let visible_lines: Vec<Line> = content_lines
+                    .into_iter()
+                    .skip(workstream.conversation_scroll)
+                    .take(inner.height as usize)
+                    .collect();
+
+                let paragraph = Paragraph::new(visible_lines).wrap(Wrap { trim: false });
+                frame.render_widget(paragraph, inner);
+            } else if !workstream.conversation_loaded {
+                // Loading state
+                let loading = Paragraph::new("Loading conversation...")
+                    .style(Style::default().fg(Color::Yellow))
+                    .wrap(Wrap { trim: true });
+                frame.render_widget(loading, inner);
+            } else {
+                // Fall back to live output if no conversation
+                let output_lines: Vec<Line> = workstream
+                    .output
+                    .iter()
+                    .rev()
+                    .take(inner.height as usize)
+                    .rev()
+                    .map(|line| {
+                        if line.is_error {
+                            Line::styled(&line.text, Style::default().fg(Color::Red))
+                        } else {
+                            Line::raw(&line.text)
+                        }
+                    })
+                    .collect();
+
+                if output_lines.is_empty() {
+                    let placeholder = Paragraph::new("No conversation yet...")
+                        .style(Style::default().fg(Color::DarkGray))
+                        .wrap(Wrap { trim: true });
+                    frame.render_widget(placeholder, inner);
+                } else {
+                    let paragraph = Paragraph::new(output_lines).wrap(Wrap { trim: false });
+                    frame.render_widget(paragraph, inner);
+                }
+            }
 
             // Render progress bar at bottom if running
             if workstream.status == TaskStatus::Running && inner.height > 2 {
@@ -1626,6 +1691,76 @@ impl ParallelTuiApp {
                 .wrap(Wrap { trim: true });
             frame.render_widget(placeholder, inner);
         }
+    }
+
+    /// Format conversation messages into lines for display.
+    fn format_conversation(&self, messages: &[MessageDto], _width: usize) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+
+        for msg in messages {
+            // Skip system messages (usually just context)
+            if matches!(msg.role, MessageRoleDto::System) {
+                continue;
+            }
+
+            // Add role header
+            let (role_label, role_color) = match msg.role {
+                MessageRoleDto::User => ("USER", Color::Rgb(100, 149, 237)), // Cornflower blue
+                MessageRoleDto::Assistant => ("ASSISTANT", Color::Rgb(50, 205, 50)), // Lime green
+                MessageRoleDto::Tool => ("TOOL", Color::Rgb(255, 165, 0)),   // Orange
+                MessageRoleDto::System => ("SYSTEM", Color::Rgb(128, 128, 128)), // Gray
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("─── {} ", role_label),
+                    Style::default().fg(role_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("─".repeat(40), Style::default().fg(Color::Rgb(60, 60, 60))),
+            ]));
+
+            // Add message content (truncate if too long)
+            let content = &msg.content;
+            if !content.is_empty() {
+                // Split by lines and add each
+                for line in content.lines().take(50) {
+                    // Limit lines per message
+                    let text_color = match msg.role {
+                        MessageRoleDto::User => Color::White,
+                        MessageRoleDto::Assistant => Color::Rgb(200, 200, 200),
+                        MessageRoleDto::Tool => Color::Rgb(180, 180, 180),
+                        MessageRoleDto::System => Color::Rgb(100, 100, 100),
+                    };
+                    lines.push(Line::styled(line.to_string(), Style::default().fg(text_color)));
+                }
+                if content.lines().count() > 50 {
+                    lines.push(Line::styled(
+                        "... (truncated)".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+            }
+
+            // Show tool calls if any
+            for tc in &msg.tool_calls {
+                lines.push(Line::from(vec![
+                    Span::styled("  → ".to_string(), Style::default().fg(Color::Rgb(255, 165, 0))),
+                    Span::styled(
+                        tc.name.clone(),
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(" ({})", truncate_str(&tc.arguments, 60)),
+                        Style::default().fg(Color::Rgb(100, 100, 100)),
+                    ),
+                ]));
+            }
+
+            // Add spacing between messages
+            lines.push(Line::raw(""));
+        }
+
+        lines
     }
 
     /// Render a grid cell.
@@ -1869,6 +2004,17 @@ impl ParallelTui {
 impl Drop for ParallelTui {
     fn drop(&mut self) {
         let _ = self.restore();
+    }
+}
+
+/// Truncate a string to max length, adding "..." if truncated.
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else if max_len <= 3 {
+        "...".to_string()
+    } else {
+        format!("{}...", &s[..max_len - 3])
     }
 }
 

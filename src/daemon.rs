@@ -8,6 +8,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
+use crate::agentic::{Conversation, Message, MessageRole, ToolCall};
 use crate::coordination::EventBus;
 use crate::error::{Error, Result};
 use crate::executor::{Activity, ExecutionEvent, ExecutionStatus, ExecutorConfig};
@@ -75,6 +76,74 @@ pub struct TaskRebaseStatusDto {
     pub needs_rebase: bool,
     /// Branch name.
     pub branch: String,
+}
+
+/// DTO for tool call (serializable version of ToolCall).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallDto {
+    /// Tool call ID.
+    pub id: String,
+    /// Tool name.
+    pub name: String,
+    /// Arguments (as JSON string).
+    pub arguments: String,
+}
+
+impl From<&ToolCall> for ToolCallDto {
+    fn from(tc: &ToolCall) -> Self {
+        Self {
+            id: tc.id.clone(),
+            name: tc.name.clone(),
+            arguments: serde_json::to_string(&tc.arguments).unwrap_or_default(),
+        }
+    }
+}
+
+/// DTO for conversation message role.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageRoleDto {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+impl From<MessageRole> for MessageRoleDto {
+    fn from(role: MessageRole) -> Self {
+        match role {
+            MessageRole::System => Self::System,
+            MessageRole::User => Self::User,
+            MessageRole::Assistant => Self::Assistant,
+            MessageRole::Tool => Self::Tool,
+        }
+    }
+}
+
+/// DTO for conversation message (serializable version of Message).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageDto {
+    /// Role of the message sender.
+    pub role: MessageRoleDto,
+    /// Content of the message.
+    pub content: String,
+    /// Tool calls made in this message (for assistant messages).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCallDto>,
+    /// Tool call ID this message is responding to (for tool messages).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl From<&Message> for MessageDto {
+    fn from(msg: &Message) -> Self {
+        Self {
+            role: msg.role.into(),
+            content: msg.content.clone(),
+            tool_calls: msg.tool_calls.iter().map(ToolCallDto::from).collect(),
+            tool_call_id: msg.tool_call_id.clone(),
+        }
+    }
 }
 
 /// Daemon configuration.
@@ -210,6 +279,8 @@ pub enum DaemonRequest {
     GetAllExecutionStatus,
     /// Get current budget status from CostTracker.
     GetBudgetStatus,
+    /// Get conversation history for a task.
+    GetConversation { id: String },
 }
 
 /// Response from the daemon.
@@ -289,6 +360,13 @@ pub enum DaemonResponse {
         daily_limit: Option<f64>,
         monthly_used: f64,
         monthly_limit: Option<f64>,
+    },
+    /// Conversation history for a task.
+    ConversationResponse {
+        task_id: String,
+        messages: Vec<MessageDto>,
+        created_at: String,
+        updated_at: String,
     },
 }
 
@@ -1325,6 +1403,32 @@ async fn process_request(
                 daily_limit: stats.daily_limit,
                 monthly_used: stats.monthly_used,
                 monthly_limit: stats.monthly_limit,
+            }
+        }
+
+        DaemonRequest::GetConversation { id } => {
+            // Get the conversation path from the executor's config
+            let exec = supervised_executor.executor().lock().await;
+            let conversation_path = exec
+                .config()
+                .data_dir
+                .join("conversations")
+                .join(format!("{}.json", id));
+            drop(exec); // Release the lock before doing file I/O
+
+            match Conversation::load(&conversation_path) {
+                Ok(conv) => {
+                    let messages: Vec<MessageDto> = conv.messages().map(MessageDto::from).collect();
+                    DaemonResponse::ConversationResponse {
+                        task_id: id,
+                        messages,
+                        created_at: conv.created_at.to_rfc3339(),
+                        updated_at: conv.updated_at.to_rfc3339(),
+                    }
+                }
+                Err(e) => DaemonResponse::Error {
+                    message: format!("Failed to load conversation: {}", e),
+                },
             }
         }
     }

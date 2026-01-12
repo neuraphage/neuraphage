@@ -15,7 +15,10 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::config::Config;
-use crate::daemon::{DaemonClient, DaemonConfig, DaemonRequest, DaemonResponse, ExecutionEventDto, ExecutionStatusDto};
+use crate::daemon::{
+    DaemonClient, DaemonConfig, DaemonRequest, DaemonResponse, ExecutionEventDto, ExecutionStatusDto, MessageDto,
+    MessageRoleDto,
+};
 use crate::error::{Error, Result};
 use crate::task::{Task, TaskStatus};
 use crate::tui::multi::{
@@ -64,6 +67,8 @@ pub struct TuiRunner {
     reconnect_attempts: u8,
     /// Signal flag for clean shutdown (SIGHUP/SIGTERM).
     shutdown_signal: Arc<AtomicBool>,
+    /// Currently focused task ID (for conversation loading).
+    current_focus_task_id: Option<String>,
 }
 
 impl TuiRunner {
@@ -109,6 +114,7 @@ impl TuiRunner {
             reconnect_backoff: Duration::from_secs(1),
             reconnect_attempts: 0,
             shutdown_signal,
+            current_focus_task_id: None,
         })
     }
 
@@ -181,6 +187,9 @@ impl TuiRunner {
                     self.refresh_tasks().await;
                     self.last_task_refresh = Instant::now();
                 }
+
+                // Check if selection changed and load conversation
+                self.check_and_load_conversation().await;
             }
 
             // Render at frame interval
@@ -343,6 +352,75 @@ impl TuiRunner {
                 // Don't disconnect just for budget errors
             }
             _ => {}
+        }
+    }
+
+    /// Load conversation for a specific task.
+    async fn load_conversation(&mut self, task_id: &str) {
+        let client = match self.client.as_mut() {
+            Some(c) => c,
+            None => return,
+        };
+
+        let request = DaemonRequest::GetConversation {
+            id: task_id.to_string(),
+        };
+        match client.request(request).await {
+            Ok(DaemonResponse::ConversationResponse { messages, .. }) => {
+                // Find the workstream and set its conversation
+                if let Some(ws) = self
+                    .app
+                    .state
+                    .workstreams
+                    .iter_mut()
+                    .find(|ws| ws.task_id.as_ref() == task_id)
+                {
+                    ws.set_conversation(messages);
+                }
+            }
+            Ok(DaemonResponse::Error { message }) => {
+                // If conversation doesn't exist, that's ok - mark as loaded with empty
+                if (message.contains("No such file") || message.contains("Failed to load"))
+                    && let Some(ws) = self
+                        .app
+                        .state
+                        .workstreams
+                        .iter_mut()
+                        .find(|ws| ws.task_id.as_ref() == task_id)
+                {
+                    ws.conversation_loaded = true;
+                }
+            }
+            Err(_) => {
+                // Don't disconnect for conversation errors
+            }
+            _ => {}
+        }
+    }
+
+    /// Check if selection changed and load conversation if needed.
+    async fn check_and_load_conversation(&mut self) {
+        // Get current selected task ID
+        let selected_task_id = self.app.state.selected().map(|ws| ws.task_id.0.clone());
+
+        // Check if selection changed
+        if selected_task_id != self.current_focus_task_id {
+            self.current_focus_task_id = selected_task_id.clone();
+
+            // If we have a selection and conversation not loaded, load it
+            if let Some(task_id) = &selected_task_id {
+                let needs_load = self
+                    .app
+                    .state
+                    .workstreams
+                    .iter()
+                    .find(|ws| ws.task_id.as_ref() == task_id.as_str())
+                    .is_some_and(|ws| !ws.conversation_loaded);
+
+                if needs_load {
+                    self.load_conversation(task_id).await;
+                }
+            }
         }
     }
 
@@ -570,6 +648,16 @@ fn apply_event(ws: &mut Workstream, event: &ExecutionEventDto) {
                 result.clone()
             };
             ws.add_output(OutputLine::new(format!("✓ {}: {}", name, result_preview)));
+
+            // Add to conversation as Tool message (if conversation is loaded)
+            if ws.conversation_loaded {
+                ws.add_conversation_message(MessageDto {
+                    role: MessageRoleDto::Tool,
+                    content: format!("[{}] {}", name, result),
+                    tool_calls: vec![],
+                    tool_call_id: None,
+                });
+            }
         }
         ExecutionEventDto::WaitingForUser { prompt } => {
             ws.needs_attention = true;
@@ -587,6 +675,16 @@ fn apply_event(ws: &mut Workstream, event: &ExecutionEventDto) {
         ExecutionEventDto::LlmResponse { content } => {
             for line in content.lines() {
                 ws.add_output(OutputLine::new(line.to_string()));
+            }
+
+            // Add to conversation as Assistant message (if conversation is loaded)
+            if ws.conversation_loaded {
+                ws.add_conversation_message(MessageDto {
+                    role: MessageRoleDto::Assistant,
+                    content: content.clone(),
+                    tool_calls: vec![],
+                    tool_call_id: None,
+                });
             }
         }
         ExecutionEventDto::ActivityChanged { activity } => {

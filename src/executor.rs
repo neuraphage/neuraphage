@@ -586,6 +586,11 @@ impl TaskExecutor {
         &self.state_store
     }
 
+    /// Get the executor configuration.
+    pub fn config(&self) -> &ExecutorConfig {
+        &self.config
+    }
+
     /// Save execution state for a task (for crash recovery).
     pub async fn save_execution_state(
         &self,
