@@ -34,6 +34,12 @@ pub struct ExecutorConfig {
     pub max_tokens: u64,
     /// Maximum cost per task in USD.
     pub max_cost: f64,
+    /// Enable automatic worktree creation for git repos.
+    pub enable_worktrees: bool,
+    /// Base directory for worktrees.
+    pub worktree_base: Option<PathBuf>,
+    /// Auto-delete branch on task completion.
+    pub auto_delete_branches: bool,
 }
 
 impl Default for ExecutorConfig {
@@ -45,17 +51,24 @@ impl Default for ExecutorConfig {
             max_iterations: 100,
             max_tokens: 1_000_000,
             max_cost: 10.0,
+            enable_worktrees: true,
+            worktree_base: None,
+            auto_delete_branches: false,
         }
     }
 }
 
 impl From<&Config> for ExecutorConfig {
     fn from(config: &Config) -> Self {
+        let default = Self::default();
         Self {
             max_concurrent: config.max_concurrent_tasks,
             data_dir: config.data_dir.clone(),
             default_model: config.api.default_model.clone(),
-            ..Default::default()
+            enable_worktrees: default.enable_worktrees,
+            worktree_base: None, // Derived from data_dir in TaskExecutor::new
+            auto_delete_branches: default.auto_delete_branches,
+            ..default
         }
     }
 }
@@ -162,6 +175,8 @@ struct RunningTask {
     event_buffer: std::collections::VecDeque<ExecutionEvent>,
     /// Index tracking where client last read from buffer.
     last_poll_idx: usize,
+    /// Path to the git worktree if one was created for this task.
+    worktree_path: Option<PathBuf>,
 }
 
 /// Result of task execution.
@@ -184,6 +199,7 @@ pub struct TaskExecutor {
     config: ExecutorConfig,
     llm: Arc<dyn LlmClient + Send + Sync>,
     running_tasks: HashMap<TaskId, RunningTask>,
+    git: crate::git::GitCoordinator,
 }
 
 impl TaskExecutor {
@@ -191,19 +207,32 @@ impl TaskExecutor {
     pub fn new(config: ExecutorConfig) -> Result<Self> {
         let llm = Arc::new(AnthropicClient::new(None, None)?);
 
+        // Initialize git coordinator with worktree base from config or derive from data_dir
+        let worktree_base = config
+            .worktree_base
+            .clone()
+            .unwrap_or_else(|| config.data_dir.parent().unwrap_or(&config.data_dir).join(".worktrees"));
+
         Ok(Self {
             config,
             llm,
             running_tasks: HashMap::new(),
+            git: crate::git::GitCoordinator::new(worktree_base),
         })
     }
 
     /// Create executor with a custom LLM client (for testing).
     pub fn with_llm(config: ExecutorConfig, llm: Arc<dyn LlmClient + Send + Sync>) -> Self {
+        let worktree_base = config
+            .worktree_base
+            .clone()
+            .unwrap_or_else(|| config.data_dir.parent().unwrap_or(&config.data_dir).join(".worktrees"));
+
         Self {
             config,
             llm,
             running_tasks: HashMap::new(),
+            git: crate::git::GitCoordinator::new(worktree_base),
         }
     }
 
@@ -280,10 +309,140 @@ impl TaskExecutor {
                 state,
                 event_buffer: std::collections::VecDeque::with_capacity(100),
                 last_poll_idx: 0,
+                worktree_path: None,
             },
         );
 
         Ok(())
+    }
+
+    /// Start a task with automatic worktree setup if in a git repo.
+    ///
+    /// If `repo_path` is a git repository and worktrees are enabled,
+    /// creates an isolated worktree for the task.
+    pub async fn start_task_with_worktree(&mut self, task: Task, repo_path: Option<PathBuf>) -> Result<()> {
+        let (working_dir, worktree_path) = if let Some(repo) = repo_path {
+            // Check if worktrees are enabled and it's a git repo
+            if self.config.enable_worktrees && self.git.is_git_repo(&repo).await {
+                // Create worktree for this task
+                let worktree = self.git.setup_worktree(&task.id, &repo).await?;
+                (Some(worktree.clone()), Some(worktree))
+            } else {
+                // Not a git repo or worktrees disabled, use as-is
+                (Some(repo), None)
+            }
+        } else {
+            (None, None)
+        };
+
+        // Start the task with the determined working directory
+        self.start_task_internal(task, working_dir, worktree_path)
+    }
+
+    /// Internal method to start a task with optional worktree tracking.
+    fn start_task_internal(
+        &mut self,
+        task: Task,
+        working_dir: Option<PathBuf>,
+        worktree_path: Option<PathBuf>,
+    ) -> Result<()> {
+        if !self.can_start_task() {
+            return Err(Error::Validation(format!(
+                "Cannot start task: at capacity ({} running)",
+                self.config.max_concurrent
+            )));
+        }
+
+        let task_id = task.id.clone();
+
+        // Check if already running
+        if self.running_tasks.contains_key(&task_id) {
+            return Err(Error::Validation(format!("Task {} is already running", task_id.0)));
+        }
+
+        // Create channels for communication
+        let (input_tx, input_rx) = mpsc::channel::<String>(1);
+        let (event_tx, event_rx) = mpsc::channel::<ExecutionEvent>(100);
+
+        // Build agentic config
+        let working_dir = working_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let conversation_path = self
+            .config
+            .data_dir
+            .join("conversations")
+            .join(format!("{}.json", task_id.0));
+
+        let agentic_config = AgenticConfig {
+            max_iterations: self.config.max_iterations,
+            max_tokens: self.config.max_tokens,
+            max_cost: self.config.max_cost,
+            model: self.config.default_model.clone(),
+            working_dir,
+            conversation_path,
+        };
+
+        // Spawn the execution task
+        let llm = Arc::clone(&self.llm);
+        let task_clone = task.clone();
+        let handle =
+            tokio::spawn(async move { execute_task(task_clone, agentic_config, llm, input_rx, event_tx).await });
+
+        let state = ExecutionState {
+            task_id: task_id.clone(),
+            status: ExecutionStatus::Running {
+                iteration: 0,
+                tokens_used: 0,
+                cost: 0.0,
+            },
+            started_at: Utc::now(),
+            last_activity: Utc::now(),
+        };
+
+        self.running_tasks.insert(
+            task_id,
+            RunningTask {
+                handle,
+                input_tx,
+                event_rx,
+                state,
+                event_buffer: std::collections::VecDeque::with_capacity(100),
+                last_poll_idx: 0,
+                worktree_path,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Clean up task resources including worktree.
+    pub async fn cleanup_task(&mut self, task_id: &TaskId) -> Result<()> {
+        // Clean up worktree if one exists
+        if self.git.get_worktree(task_id).is_some() {
+            self.git
+                .cleanup_worktree(task_id, self.config.auto_delete_branches)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Get worktree info for a task.
+    pub fn get_worktree(&self, task_id: &TaskId) -> Option<&crate::git::WorktreeInfo> {
+        self.git.get_worktree(task_id)
+    }
+
+    /// Get the GitCoordinator for direct access.
+    pub fn git(&self) -> &crate::git::GitCoordinator {
+        &self.git
+    }
+
+    /// Get mutable access to the GitCoordinator.
+    pub fn git_mut(&mut self) -> &mut crate::git::GitCoordinator {
+        &mut self.git
+    }
+
+    /// Get the worktree path for a running task, if one was created.
+    pub fn get_running_worktree_path(&self, task_id: &TaskId) -> Option<&PathBuf> {
+        self.running_tasks.get(task_id).and_then(|r| r.worktree_path.as_ref())
     }
 
     /// Provide user input to a waiting task.
