@@ -906,6 +906,10 @@ async fn run_client_command(config: &Config, command: Command) -> Result<()> {
         },
 
         Command::Events(_) => unreachable!("Events commands handled before daemon check"),
+
+        Command::Tui { layout, filter } => {
+            run_tui(client, config, layout, filter).await?;
+        }
     }
 
     Ok(())
@@ -1303,5 +1307,53 @@ fn handle_counts_response(response: DaemonResponse) {
             eprintln!("{} {}", "✗".red(), message);
         }
         _ => {}
+    }
+}
+
+/// Run the parallel workstream TUI.
+async fn run_tui(_client: DaemonClient, config: &Config, layout: Option<String>, filter: Vec<String>) -> Result<()> {
+    use neuraphage::tui::ParallelTuiApp;
+
+    // Parse layout mode override
+    let layout_mode = layout.as_ref().and_then(|s| parse_layout_mode(s));
+    if let Some(layout_str) = &layout
+        && layout_mode.is_none()
+    {
+        eprintln!(
+            "{} Invalid layout mode '{}'. Valid options: dashboard, split, grid, focus",
+            "✗".red(),
+            layout_str
+        );
+        return Ok(());
+    }
+
+    // Initialize TUI
+    let mut app = ParallelTuiApp::from_settings(&config.tui);
+    if let Some(mode) = layout_mode {
+        app.state.layout_mode = mode;
+    }
+    if !filter.is_empty() {
+        app.state.filter.task_ids = filter;
+    }
+
+    // TODO: Implement TuiRunner in Phase 2-3
+    // For now, just show a message
+    println!("{} TUI mode not yet implemented. Coming soon!", "!".yellow());
+    println!();
+    println!("  Layout: {:?}", app.state.layout_mode);
+    println!("  Filter: {:?}", app.state.filter.task_ids);
+
+    Ok(())
+}
+
+/// Parse layout mode from string.
+fn parse_layout_mode(s: &str) -> Option<neuraphage::tui::LayoutMode> {
+    use neuraphage::tui::LayoutMode;
+    match s.to_lowercase().as_str() {
+        "dashboard" | "d" => Some(LayoutMode::Dashboard),
+        "split" | "s" => Some(LayoutMode::Split),
+        "grid" | "g" => Some(LayoutMode::Grid),
+        "focus" | "f" => Some(LayoutMode::Focus),
+        _ => None,
     }
 }

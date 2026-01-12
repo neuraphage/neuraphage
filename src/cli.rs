@@ -284,6 +284,17 @@ pub enum Command {
     /// View coordination events
     #[command(subcommand)]
     Events(EventsCommand),
+
+    /// Launch parallel workstream TUI
+    Tui {
+        /// Layout mode override (dashboard, split, grid, focus)
+        #[arg(short, long)]
+        layout: Option<String>,
+
+        /// Filter to specific task IDs
+        #[arg(short, long)]
+        filter: Vec<String>,
+    },
 }
 
 /// Events tracking commands.
@@ -619,6 +630,39 @@ mod tests {
             assert_eq!(limit, 50);
         } else {
             panic!("Expected Events Task command");
+        }
+    }
+
+    #[test]
+    fn test_tui_basic() {
+        let cli = Cli::parse_from(["np", "tui"]);
+        if let Some(Command::Tui { layout, filter }) = cli.command {
+            assert!(layout.is_none());
+            assert!(filter.is_empty());
+        } else {
+            panic!("Expected Tui command");
+        }
+    }
+
+    #[test]
+    fn test_tui_with_layout() {
+        let cli = Cli::parse_from(["np", "tui", "--layout", "grid"]);
+        if let Some(Command::Tui { layout, filter }) = cli.command {
+            assert_eq!(layout, Some("grid".to_string()));
+            assert!(filter.is_empty());
+        } else {
+            panic!("Expected Tui command");
+        }
+    }
+
+    #[test]
+    fn test_tui_with_filter() {
+        let cli = Cli::parse_from(["np", "tui", "--filter", "task-1", "--filter", "task-2"]);
+        if let Some(Command::Tui { layout, filter }) = cli.command {
+            assert!(layout.is_none());
+            assert_eq!(filter, vec!["task-1".to_string(), "task-2".to_string()]);
+        } else {
+            panic!("Expected Tui command");
         }
     }
 }

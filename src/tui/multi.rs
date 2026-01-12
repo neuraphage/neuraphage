@@ -349,6 +349,8 @@ pub struct WorkstreamFilter {
     pub name_filter: Option<String>,
     /// Only show tasks needing attention.
     pub attention_only: bool,
+    /// Filter to specific task IDs (empty = show all).
+    pub task_ids: Vec<String>,
 }
 
 /// A single workstream being tracked.
