@@ -406,6 +406,9 @@ impl Daemon {
             None
         };
 
+        // Spawn completion handler loop
+        let _completion_handle = self.spawn_completion_loop();
+
         // Bind to socket
         let listener = UnixListener::bind(&self.config.socket_path)?;
         log::info!("Daemon listening on {:?}", self.config.socket_path);
@@ -453,6 +456,68 @@ impl Daemon {
             std::fs::remove_file(&self.config.pid_path)?;
         }
         Ok(())
+    }
+
+    /// Spawn the completion handler loop.
+    ///
+    /// Polls for completed tasks and updates TaskManager status and removes
+    /// execution state. This keeps the daemon as the coordinator between
+    /// TaskManager (engram) and Executor (runtime) without coupling them directly.
+    fn spawn_completion_loop(&self) -> tokio::task::JoinHandle<()> {
+        let manager = Arc::clone(&self.manager);
+        let supervised_executor = Arc::clone(&self.supervised_executor);
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+
+            loop {
+                interval.tick().await;
+
+                // Poll for completed tasks
+                let completed = {
+                    let mut exec = supervised_executor.executor().lock().await;
+                    exec.poll_completed().await
+                };
+
+                // Handle each completed task
+                for result in completed {
+                    let task_id = result.task_id.clone();
+                    log::info!("Task {} completed with status: {:?}", task_id.0, result.status);
+
+                    // Update TaskManager status
+                    let new_status = match &result.status {
+                        ExecutionStatus::Completed { reason: _ } => TaskStatus::Completed,
+                        ExecutionStatus::Failed { error: _ } => TaskStatus::Failed,
+                        ExecutionStatus::Cancelled => TaskStatus::Cancelled,
+                        _ => TaskStatus::Running, // shouldn't happen
+                    };
+
+                    // Close the task in TaskManager
+                    {
+                        let mut mgr = manager.lock().await;
+                        if let Err(e) = mgr.close_task(&task_id, new_status, None) {
+                            log::error!("Failed to update task status for {}: {}", task_id.0, e);
+                        }
+                    }
+
+                    // Remove execution state (for crash recovery)
+                    {
+                        let exec = supervised_executor.executor().lock().await;
+                        if let Err(e) = exec.remove_execution_state(&task_id).await {
+                            log::warn!("Failed to remove execution state for {}: {}", task_id.0, e);
+                        }
+                    }
+
+                    // Clean up worktree if one was created
+                    {
+                        let mut exec = supervised_executor.executor().lock().await;
+                        if let Err(e) = exec.cleanup_task(&task_id).await {
+                            log::warn!("Failed to cleanup task {}: {}", task_id.0, e);
+                        }
+                    }
+                }
+            }
+        })
     }
 }
 
@@ -635,6 +700,9 @@ async fn process_request(
 
             // Parse working directory
             let working_dir = working_dir.map(std::path::PathBuf::from);
+            let working_dir_path = working_dir
+                .clone()
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
             // Start execution through supervised executor
             match supervised_executor.start_task(task, working_dir).await {
@@ -642,6 +710,18 @@ async fn process_request(
                     // Update task status to Running
                     let mut mgr = manager.lock().await;
                     let _ = mgr.set_status(&task_id, TaskStatus::Running);
+
+                    // Save execution state for crash recovery
+                    {
+                        let exec = supervised_executor.executor().lock().await;
+                        if let Err(e) = exec
+                            .save_execution_state(&task_id, &working_dir_path, None, "user_request")
+                            .await
+                        {
+                            log::warn!("Failed to save execution state for {}: {}", id, e);
+                        }
+                    }
+
                     DaemonResponse::TaskStarted { task_id: id }
                 }
                 Err(e) => DaemonResponse::Error { message: e.to_string() },
@@ -758,14 +838,27 @@ async fn process_request(
             drop(mgr);
 
             // Start the task with worktree setup
-            let repo = PathBuf::from(repo_path);
+            let repo = PathBuf::from(&repo_path);
             {
                 let mut exec = supervised_executor.executor().lock().await;
-                match exec.start_task_with_worktree(task.clone(), Some(repo)).await {
+                match exec.start_task_with_worktree(task.clone(), Some(repo.clone())).await {
                     Ok(()) => {
                         // Update task status to Running
                         let mut mgr = manager.lock().await;
                         let _ = mgr.set_status(&task.id, TaskStatus::Running);
+
+                        // Get worktree path if one was created
+                        let worktree_path = exec.get_running_worktree_path(&task.id).cloned();
+
+                        // Save execution state for crash recovery
+                        let working_dir = worktree_path.as_ref().unwrap_or(&repo);
+                        if let Err(e) = exec
+                            .save_execution_state(&task.id, working_dir, worktree_path.as_deref(), "user_request")
+                            .await
+                        {
+                            log::warn!("Failed to save execution state for {}: {}", task.id.0, e);
+                        }
+
                         DaemonResponse::Task(Some(task))
                     }
                     Err(e) => DaemonResponse::Error { message: e.to_string() },
