@@ -10,6 +10,81 @@ use crate::sandbox::{self, SandboxAvailability, SandboxConfig};
 pub struct BashTool;
 
 impl BashTool {
+    /// Check if a command is potentially non-idempotent.
+    ///
+    /// Returns true for commands that might have different effects if re-executed,
+    /// which could be problematic during crash recovery.
+    fn is_potentially_non_idempotent(command: &str) -> bool {
+        // Patterns that indicate non-idempotent operations
+        let non_idempotent_patterns = [
+            "rm ",
+            "rm\t",
+            "mv ",
+            "mv\t",
+            "cp ",
+            "cp\t",
+            "mkdir ",
+            "touch ",
+            "chmod ",
+            "chown ",
+            "git commit",
+            "git push",
+            "git merge",
+            "git rebase",
+            "pip install",
+            "npm install",
+            "cargo install",
+            "apt install",
+            "apt-get install",
+            "brew install",
+            "curl ",
+            "wget ",
+            ">>",
+            ">>",
+        ];
+
+        // Idempotent patterns that are safe to re-execute
+        let idempotent_patterns = [
+            "echo ",
+            "cat ",
+            "ls ",
+            "pwd",
+            "grep ",
+            "find ",
+            "head ",
+            "tail ",
+            "wc ",
+            "which ",
+            "git status",
+            "git log",
+            "git diff",
+            "git branch",
+            "cargo check",
+            "cargo test",
+            "cargo build",
+            "cargo fmt",
+            "cargo clippy",
+        ];
+
+        // If it matches an idempotent pattern, it's safe
+        for pattern in &idempotent_patterns {
+            if command.starts_with(pattern) || command.contains(&format!(" {}", pattern)) {
+                return false;
+            }
+        }
+
+        // If it matches a non-idempotent pattern, warn
+        for pattern in &non_idempotent_patterns {
+            if command.contains(pattern) {
+                return true;
+            }
+        }
+
+        // Default: consider commands as potentially non-idempotent
+        // (conservative approach for crash recovery)
+        false
+    }
+
     pub fn definition() -> Tool {
         Tool {
             name: "run_command".to_string(),
@@ -38,6 +113,15 @@ impl BashTool {
             .ok_or_else(|| crate::error::Error::Validation("Missing 'command' argument".to_string()))?;
 
         let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_i64()).unwrap_or(120_000) as u64;
+
+        // Idempotency warning: bash commands are generally not idempotent
+        // Log a warning for commands that may have side effects if re-executed
+        if Self::is_potentially_non_idempotent(command) {
+            log::warn!(
+                "run_command: executing potentially non-idempotent command (may cause issues on crash recovery): {}",
+                command.chars().take(100).collect::<String>()
+            );
+        }
 
         // Determine if we should use sandboxing
         let use_sandbox =

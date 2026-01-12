@@ -86,6 +86,18 @@ impl WriteFileTool {
 
         let full_path = ctx.working_dir.join(path);
 
+        // Idempotency check: if file already has this exact content, skip the write
+        if full_path.exists()
+            && let Ok(existing) = tokio::fs::read_to_string(&full_path).await
+            && existing == content
+        {
+            log::debug!("write_file: file {} already has identical content (idempotent)", path);
+            return Ok(ToolResult::success(format!(
+                "File {} already has identical content (no write needed)",
+                path
+            )));
+        }
+
         // Ensure parent directory exists
         if let Some(parent) = full_path.parent()
             && let Err(e) = tokio::fs::create_dir_all(parent).await
@@ -352,5 +364,54 @@ mod tests {
             .await
             .unwrap();
         assert!(result.output.contains("No files found"));
+    }
+
+    #[tokio::test]
+    async fn test_write_file_idempotent() {
+        let (temp, ctx) = setup();
+
+        // First write
+        let result1 = WriteFileTool::execute(
+            &ctx,
+            &serde_json::json!({
+                "path": "idem.txt",
+                "content": "Same content"
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(result1.output.contains("Wrote"), "First write should succeed");
+
+        // Second write with same content should be idempotent
+        let result2 = WriteFileTool::execute(
+            &ctx,
+            &serde_json::json!({
+                "path": "idem.txt",
+                "content": "Same content"
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result2.output.contains("already has identical content"),
+            "Second write should be idempotent: {}",
+            result2.output
+        );
+
+        // Third write with different content should write
+        let result3 = WriteFileTool::execute(
+            &ctx,
+            &serde_json::json!({
+                "path": "idem.txt",
+                "content": "Different content"
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(result3.output.contains("Wrote"), "Different content should write");
+
+        // Verify final content
+        let content = std::fs::read_to_string(temp.path().join("idem.txt")).unwrap();
+        assert_eq!(content, "Different content");
     }
 }
