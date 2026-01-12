@@ -386,6 +386,26 @@ impl<L: LlmClient> AgenticLoop<L> {
     pub fn save(&self) -> Result<()> {
         self.conversation.save()
     }
+
+    /// Inject a system message into the conversation.
+    ///
+    /// This is used by supervision to inject nudges, sync messages, or other
+    /// system-level messages that should appear in the next iteration.
+    /// The message is added as a user message with special formatting
+    /// that the LLM recognizes as system-level.
+    pub fn inject_system_message(&mut self, content: &str) -> Result<()> {
+        // Add as a user message with the injected content
+        // The special XML tags in the content identify it as a system injection
+        self.conversation.add_message(Message {
+            role: MessageRole::User,
+            content: content.to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        })?;
+
+        // Persist immediately in case of crash
+        self.save()
+    }
 }
 
 #[cfg(test)]

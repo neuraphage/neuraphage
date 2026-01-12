@@ -44,7 +44,10 @@ pub use personas::{SyncMessage, SyncResult, Syncer, SyncerConfig};
 pub use personas::{TaskSnapshot, WatchResult, Watcher, WatcherConfig, WatcherRecommendation};
 
 // Re-export executor types
-pub use executor::{ExecutionEvent, ExecutionResult, ExecutionStatus, ExecutorConfig, TaskExecutor};
+pub use executor::{
+    ExecutionEvent, ExecutionResult, ExecutionStatus, ExecutorConfig, InjectedMessage, NudgeSeverity, SyncUrgency,
+    TaskExecutor,
+};
 
 // Re-export REPL types
 pub use repl::{Activity, Repl, ReplDisplay, ReplInput, ReplScreen, Session, StatusState};

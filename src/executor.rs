@@ -5,12 +5,14 @@
 //! - User input routing
 //! - Execution state persistence
 //! - Concurrency limits
+//! - Message injection for supervision
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -132,6 +134,80 @@ impl std::fmt::Display for Activity {
     }
 }
 
+/// Message injected into a running task from supervision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum InjectedMessage {
+    /// Nudge from Watcher - hints or warnings about task health.
+    Nudge {
+        /// The nudge message content.
+        message: String,
+        /// Severity of the nudge.
+        severity: NudgeSeverity,
+    },
+    /// Sync message from another task via Syncer.
+    Sync {
+        /// Source task that generated the learning.
+        source_task: TaskId,
+        /// The sync message content.
+        message: String,
+        /// How urgent this sync is.
+        urgency: SyncUrgency,
+    },
+    /// Pause command from Watcher.
+    Pause {
+        /// Reason for pausing.
+        reason: String,
+    },
+}
+
+impl InjectedMessage {
+    /// Format the message for injection into the conversation.
+    pub fn format_for_injection(&self) -> String {
+        match self {
+            InjectedMessage::Nudge { message, severity } => {
+                format!("<system-nudge severity=\"{:?}\">{}</system-nudge>", severity, message)
+            }
+            InjectedMessage::Sync {
+                source_task,
+                message,
+                urgency,
+            } => {
+                format!(
+                    "<sync-message from=\"{}\" urgency=\"{:?}\">\n{}\n</sync-message>",
+                    source_task.0, urgency, message
+                )
+            }
+            InjectedMessage::Pause { reason } => {
+                format!("<system-pause>{}</system-pause>", reason)
+            }
+        }
+    }
+}
+
+/// Severity of a nudge message from the Watcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NudgeSeverity {
+    /// Gentle suggestion - take it or leave it.
+    Hint,
+    /// More urgent - should address soon.
+    Warning,
+    /// Critical - must address immediately.
+    Critical,
+}
+
+/// Urgency of a sync message from the Syncer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncUrgency {
+    /// Must be addressed before continuing.
+    Blocking,
+    /// Would save time/tokens if addressed.
+    Helpful,
+    /// Nice to know, no action needed.
+    Fyi,
+}
+
 /// Event from task execution.
 #[derive(Debug, Clone)]
 pub enum ExecutionEvent {
@@ -167,6 +243,8 @@ struct RunningTask {
     handle: JoinHandle<ExecutionResult>,
     /// Channel to send user input.
     input_tx: mpsc::Sender<String>,
+    /// Channel to inject messages from supervision (nudges, syncs).
+    injected_tx: mpsc::Sender<InjectedMessage>,
     /// Channel to receive events.
     event_rx: mpsc::Receiver<ExecutionEvent>,
     /// Current state (mutable, updated from events).
@@ -264,6 +342,7 @@ impl TaskExecutor {
 
         // Create channels for communication
         let (input_tx, input_rx) = mpsc::channel::<String>(1);
+        let (injected_tx, injected_rx) = mpsc::channel::<InjectedMessage>(32);
         let (event_tx, event_rx) = mpsc::channel::<ExecutionEvent>(100);
 
         // Build agentic config
@@ -286,8 +365,9 @@ impl TaskExecutor {
         // Spawn the execution task
         let llm = Arc::clone(&self.llm);
         let task_clone = task.clone();
-        let handle =
-            tokio::spawn(async move { execute_task(task_clone, agentic_config, llm, input_rx, event_tx).await });
+        let handle = tokio::spawn(async move {
+            execute_task(task_clone, agentic_config, llm, input_rx, injected_rx, event_tx).await
+        });
 
         let state = ExecutionState {
             task_id: task_id.clone(),
@@ -305,6 +385,7 @@ impl TaskExecutor {
             RunningTask {
                 handle,
                 input_tx,
+                injected_tx,
                 event_rx,
                 state,
                 event_buffer: std::collections::VecDeque::with_capacity(100),
@@ -362,6 +443,7 @@ impl TaskExecutor {
 
         // Create channels for communication
         let (input_tx, input_rx) = mpsc::channel::<String>(1);
+        let (injected_tx, injected_rx) = mpsc::channel::<InjectedMessage>(32);
         let (event_tx, event_rx) = mpsc::channel::<ExecutionEvent>(100);
 
         // Build agentic config
@@ -384,8 +466,9 @@ impl TaskExecutor {
         // Spawn the execution task
         let llm = Arc::clone(&self.llm);
         let task_clone = task.clone();
-        let handle =
-            tokio::spawn(async move { execute_task(task_clone, agentic_config, llm, input_rx, event_tx).await });
+        let handle = tokio::spawn(async move {
+            execute_task(task_clone, agentic_config, llm, input_rx, injected_rx, event_tx).await
+        });
 
         let state = ExecutionState {
             task_id: task_id.clone(),
@@ -403,6 +486,7 @@ impl TaskExecutor {
             RunningTask {
                 handle,
                 input_tx,
+                injected_tx,
                 event_rx,
                 state,
                 event_buffer: std::collections::VecDeque::with_capacity(100),
@@ -620,6 +704,42 @@ impl TaskExecutor {
     pub fn running_task_ids(&self) -> Vec<TaskId> {
         self.running_tasks.keys().cloned().collect()
     }
+
+    /// Inject a message into a running task.
+    ///
+    /// This is used by supervision to send nudges, sync messages, or pause commands.
+    pub async fn inject_message(&self, task_id: &TaskId, message: InjectedMessage) -> Result<()> {
+        let running = self
+            .running_tasks
+            .get(task_id)
+            .ok_or_else(|| Error::TaskNotFound { id: task_id.0.clone() })?;
+
+        running
+            .injected_tx
+            .send(message)
+            .await
+            .map_err(|_| Error::Daemon("Task is not accepting injected messages".to_string()))?;
+
+        Ok(())
+    }
+
+    /// Try to inject a message into a running task (non-blocking).
+    ///
+    /// Returns true if the message was sent, false if the channel is full.
+    pub fn try_inject_message(&self, task_id: &TaskId, message: InjectedMessage) -> Result<bool> {
+        let running = self
+            .running_tasks
+            .get(task_id)
+            .ok_or_else(|| Error::TaskNotFound { id: task_id.0.clone() })?;
+
+        match running.injected_tx.try_send(message) {
+            Ok(()) => Ok(true),
+            Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(Error::Daemon("Task injection channel closed".to_string()))
+            }
+        }
+    }
 }
 
 /// Execute a task through the agentic loop.
@@ -628,6 +748,7 @@ async fn execute_task(
     config: AgenticConfig,
     llm: Arc<dyn LlmClient + Send + Sync>,
     mut input_rx: mpsc::Receiver<String>,
+    mut injected_rx: mpsc::Receiver<InjectedMessage>,
     event_tx: mpsc::Sender<ExecutionEvent>,
 ) -> ExecutionResult {
     // Create or load the agentic loop (passing event_tx for streaming)
@@ -667,6 +788,49 @@ async fn execute_task(
 
     // Run the loop
     loop {
+        // Process any injected messages before the iteration
+        while let Ok(msg) = injected_rx.try_recv() {
+            match msg {
+                InjectedMessage::Nudge { message, severity } => {
+                    // Inject as system message
+                    let nudge_content = format!("<system-nudge severity=\"{:?}\">{}</system-nudge>", severity, message);
+                    if let Err(e) = agentic_loop.inject_system_message(&nudge_content) {
+                        log::warn!("Failed to inject nudge: {}", e);
+                    }
+                }
+                InjectedMessage::Sync {
+                    source_task,
+                    message,
+                    urgency,
+                } => {
+                    // Inject as sync message
+                    let sync_content = format!(
+                        "<sync-message from=\"{}\" urgency=\"{:?}\">\n{}\n</sync-message>",
+                        source_task.0, urgency, message
+                    );
+                    if let Err(e) = agentic_loop.inject_system_message(&sync_content) {
+                        log::warn!("Failed to inject sync message: {}", e);
+                    }
+                }
+                InjectedMessage::Pause { reason } => {
+                    let _ = event_tx
+                        .send(ExecutionEvent::Failed {
+                            error: format!("Paused by Watcher: {}", reason),
+                        })
+                        .await;
+                    return ExecutionResult {
+                        task_id: task.id,
+                        status: ExecutionStatus::Failed {
+                            error: format!("Paused: {}", reason),
+                        },
+                        iterations: agentic_loop.iteration(),
+                        tokens_used: agentic_loop.tokens_used(),
+                        cost: agentic_loop.cost(),
+                    };
+                }
+            }
+        }
+
         let result = agentic_loop.iterate(&task).await;
 
         // Send iteration event
