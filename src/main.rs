@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 mod cli;
 
-use cli::{Cli, Command, DaemonCommand, MergeCommand, WorktreeCommand};
+use cli::{Cli, Command, CostCommand, DaemonCommand, MergeCommand, WorktreeCommand};
 use neuraphage::config::Config;
 use neuraphage::daemon::{
     ActivityDto, Daemon, DaemonClient, DaemonRequest, DaemonResponse, ExecutionEventDto, ExecutionStatusDto,
@@ -231,6 +231,147 @@ fn daemonize(daemon_config: &neuraphage::DaemonConfig) -> Result<()> {
         }
         Err(e) => Err(eyre::eyre!("Failed to daemonize: {:?}", e)),
     }
+}
+
+/// Handle cost tracking commands.
+async fn handle_cost_command(config: &Config, cmd: CostCommand) -> Result<()> {
+    use chrono::{Datelike, NaiveDate, Utc};
+    use neuraphage::cost::{CostEntry, CostTracker};
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    match cmd {
+        CostCommand::Status => {
+            let tracker = CostTracker::new(config.budget.clone(), config.model_pricing.clone(), &config.data_dir)?;
+
+            let stats = tracker.get_stats().await;
+
+            println!("{}", "Cost Status".cyan().bold());
+            println!();
+
+            // Daily usage
+            print!("  Daily:   ${:.2}", stats.daily_used);
+            if let Some(limit) = stats.daily_limit {
+                let pct = (stats.daily_used / limit) * 100.0;
+                let pct_str = format!(" ({:.0}% of ${:.2})", pct, limit);
+                if pct > 90.0 {
+                    print!("{}", pct_str.red());
+                } else if pct > 75.0 {
+                    print!("{}", pct_str.yellow());
+                } else {
+                    print!("{}", pct_str.dimmed());
+                }
+            } else {
+                print!("{}", " (no limit)".dimmed());
+            }
+            println!();
+
+            // Monthly usage
+            print!("  Monthly: ${:.2}", stats.monthly_used);
+            if let Some(limit) = stats.monthly_limit {
+                let pct = (stats.monthly_used / limit) * 100.0;
+                let pct_str = format!(" ({:.0}% of ${:.2})", pct, limit);
+                if pct > 90.0 {
+                    print!("{}", pct_str.red());
+                } else if pct > 75.0 {
+                    print!("{}", pct_str.yellow());
+                } else {
+                    print!("{}", pct_str.dimmed());
+                }
+            } else {
+                print!("{}", " (no limit)".dimmed());
+            }
+            println!();
+        }
+        CostCommand::Report { from, to, group_by } => {
+            let today = Utc::now().date_naive();
+
+            let to_date = to
+                .map(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d"))
+                .transpose()
+                .context("Invalid 'to' date format (use YYYY-MM-DD)")?
+                .unwrap_or(today);
+
+            let from_date = from
+                .map(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d"))
+                .transpose()
+                .context("Invalid 'from' date format (use YYYY-MM-DD)")?
+                .unwrap_or_else(|| to_date.with_day(1).unwrap_or(to_date));
+
+            let ledger_path = config.data_dir.join("cost_ledger.jsonl");
+            if !ledger_path.exists() {
+                println!("{}", "No cost data recorded yet.".dimmed());
+                return Ok(());
+            }
+
+            let file = File::open(&ledger_path).context("Failed to open cost ledger")?;
+            let reader = BufReader::new(file);
+
+            let mut totals: HashMap<String, f64> = HashMap::new();
+            let mut grand_total = 0.0;
+
+            for line in reader.lines() {
+                let line = line.context("Failed to read ledger line")?;
+                let entry: CostEntry = match serde_json::from_str(&line) {
+                    Ok(e) => e,
+                    Err(_) => continue, // Skip malformed entries
+                };
+                let entry_date = entry.timestamp.date_naive();
+
+                if entry_date >= from_date && entry_date <= to_date {
+                    let key = match group_by.as_str() {
+                        "day" => entry_date.to_string(),
+                        "task" => entry.task_id.clone(),
+                        "model" => entry.model.clone(),
+                        _ => "unknown".to_string(),
+                    };
+                    *totals.entry(key).or_insert(0.0) += entry.cost;
+                    grand_total += entry.cost;
+                }
+            }
+
+            println!("{} {} to {}", "Cost Report:".cyan().bold(), from_date, to_date);
+            println!();
+
+            if totals.is_empty() {
+                println!("  {}", "No costs in this period.".dimmed());
+            } else {
+                let mut sorted: Vec<_> = totals.into_iter().collect();
+                sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+                for (key, cost) in sorted {
+                    println!("  {:30} ${:.4}", key, cost);
+                }
+                println!();
+                println!("  {:30} {}", "Total:".bold(), format!("${:.4}", grand_total).bold());
+            }
+        }
+        CostCommand::Task { id } => {
+            let tracker = CostTracker::new(config.budget.clone(), config.model_pricing.clone(), &config.data_dir)?;
+
+            let cost = tracker.get_task_cost(&id).await;
+
+            println!("{} {}", "Task:".cyan(), id);
+            println!("  Cost: ${:.4}", cost);
+
+            // Check against per-task limit
+            if config.budget.per_task > 0.0 {
+                let pct = (cost / config.budget.per_task) * 100.0;
+                print!("  Limit: ${:.2}", config.budget.per_task);
+                let pct_str = format!(" ({:.0}% used)", pct);
+                if pct > 90.0 {
+                    println!("{}", pct_str.red());
+                } else if pct > 75.0 {
+                    println!("{}", pct_str.yellow());
+                } else {
+                    println!("{}", pct_str.dimmed());
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn run_client_command(config: &Config, command: Command) -> Result<()> {
@@ -592,6 +733,10 @@ async fn run_client_command(config: &Config, command: Command) -> Result<()> {
                 }
             }
         },
+        Command::Cost(cost_cmd) => {
+            // Cost commands don't need the daemon - they work directly with the ledger file
+            handle_cost_command(config, cost_cmd).await?;
+        }
     }
 
     Ok(())

@@ -272,6 +272,10 @@ pub enum Command {
     /// Manage merge queue
     #[command(subcommand)]
     Merge(MergeCommand),
+
+    /// View cost statistics and budget usage
+    #[command(subcommand)]
+    Cost(CostCommand),
 }
 
 /// Worktree management commands.
@@ -301,6 +305,34 @@ pub enum MergeCommand {
         /// Target branch (default: main)
         #[arg(short, long)]
         target: Option<String>,
+    },
+}
+
+/// Cost tracking commands.
+#[derive(Subcommand)]
+pub enum CostCommand {
+    /// Show current budget usage
+    Status,
+
+    /// Show cost report for date range
+    Report {
+        /// Start date (YYYY-MM-DD), defaults to start of month
+        #[arg(short, long)]
+        from: Option<String>,
+
+        /// End date (YYYY-MM-DD), defaults to today
+        #[arg(short, long)]
+        to: Option<String>,
+
+        /// Group by: day, task, model
+        #[arg(short, long, default_value = "day")]
+        group_by: String,
+    },
+
+    /// Show cost for a specific task
+    Task {
+        /// Task ID
+        id: String,
     },
 }
 
@@ -409,6 +441,56 @@ mod tests {
             assert_eq!(target, Some("develop".to_string()));
         } else {
             panic!("Expected Merge Enqueue command");
+        }
+    }
+
+    #[test]
+    fn test_cost_status() {
+        let cli = Cli::parse_from(["np", "cost", "status"]);
+        assert!(matches!(cli.command, Some(Command::Cost(CostCommand::Status))));
+    }
+
+    #[test]
+    fn test_cost_report() {
+        let cli = Cli::parse_from(["np", "cost", "report"]);
+        if let Some(Command::Cost(CostCommand::Report { from, to, group_by })) = cli.command {
+            assert!(from.is_none());
+            assert!(to.is_none());
+            assert_eq!(group_by, "day");
+        } else {
+            panic!("Expected Cost Report command");
+        }
+    }
+
+    #[test]
+    fn test_cost_report_with_dates() {
+        let cli = Cli::parse_from([
+            "np",
+            "cost",
+            "report",
+            "--from",
+            "2024-01-01",
+            "--to",
+            "2024-01-31",
+            "--group-by",
+            "task",
+        ]);
+        if let Some(Command::Cost(CostCommand::Report { from, to, group_by })) = cli.command {
+            assert_eq!(from, Some("2024-01-01".to_string()));
+            assert_eq!(to, Some("2024-01-31".to_string()));
+            assert_eq!(group_by, "task");
+        } else {
+            panic!("Expected Cost Report command");
+        }
+    }
+
+    #[test]
+    fn test_cost_task() {
+        let cli = Cli::parse_from(["np", "cost", "task", "task-123"]);
+        if let Some(Command::Cost(CostCommand::Task { id })) = cli.command {
+            assert_eq!(id, "task-123");
+        } else {
+            panic!("Expected Cost Task command");
         }
     }
 }
