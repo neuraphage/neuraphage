@@ -729,4 +729,98 @@ mod tests {
         assert_eq!(ws.output.len(), 1);
         assert!(ws.output[0].is_error);
     }
+
+    #[test]
+    fn test_apply_execution_status_completed() {
+        let task = make_test_task("task-123", "Test task", TaskStatus::Running);
+        let mut ws = Workstream::new(task.id.clone(), &task.description, task.status);
+        ws.needs_attention = true; // Set to true first
+
+        apply_execution_status(
+            &mut ws,
+            &ExecutionStatusDto::Completed {
+                reason: "Task finished".to_string(),
+            },
+        );
+
+        assert!(!ws.needs_attention);
+        assert!((ws.progress - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_apply_event_tool_completed_truncation() {
+        let task = make_test_task("task-123", "Test task", TaskStatus::Running);
+        let mut ws = Workstream::new(task.id.clone(), &task.description, task.status);
+
+        // Create a long result that should be truncated
+        let long_result = "x".repeat(200);
+        apply_event(
+            &mut ws,
+            &ExecutionEventDto::ToolCompleted {
+                name: "read_file".to_string(),
+                result: long_result,
+            },
+        );
+
+        assert_eq!(ws.output.len(), 1);
+        // Result should be truncated to 100 chars + "..."
+        assert!(ws.output[0].text.contains("..."));
+        assert!(ws.output[0].text.len() < 150);
+    }
+
+    #[test]
+    fn test_apply_event_budget_warning() {
+        let task = make_test_task("task-123", "Test task", TaskStatus::Running);
+        let mut ws = Workstream::new(task.id.clone(), &task.description, task.status);
+
+        apply_event(
+            &mut ws,
+            &ExecutionEventDto::BudgetWarning {
+                budget_type: "daily".to_string(),
+                current: 8.50,
+                limit: 10.0,
+                threshold: 80.0,
+            },
+        );
+
+        assert_eq!(ws.output.len(), 1);
+        assert!(ws.output[0].text.contains("Budget warning"));
+        assert!(!ws.needs_attention); // Warning doesn't require attention
+    }
+
+    #[test]
+    fn test_apply_event_budget_exceeded() {
+        let task = make_test_task("task-123", "Test task", TaskStatus::Running);
+        let mut ws = Workstream::new(task.id.clone(), &task.description, task.status);
+
+        apply_event(
+            &mut ws,
+            &ExecutionEventDto::BudgetExceeded {
+                budget_type: "daily".to_string(),
+                current: 12.50,
+                limit: 10.0,
+            },
+        );
+
+        assert!(ws.needs_attention);
+        assert!(ws.attention_reason.as_ref().unwrap().contains("Budget exceeded"));
+        assert_eq!(ws.output.len(), 1);
+        assert!(ws.output[0].is_error);
+    }
+
+    #[test]
+    fn test_apply_event_llm_response_multiline() {
+        let task = make_test_task("task-123", "Test task", TaskStatus::Running);
+        let mut ws = Workstream::new(task.id.clone(), &task.description, task.status);
+
+        apply_event(
+            &mut ws,
+            &ExecutionEventDto::LlmResponse {
+                content: "Line 1\nLine 2\nLine 3".to_string(),
+            },
+        );
+
+        // Should create 3 separate output lines
+        assert_eq!(ws.output.len(), 3);
+    }
 }
