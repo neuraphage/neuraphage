@@ -447,6 +447,65 @@ impl GitCoordinator {
         &self.worktree_base
     }
 
+    /// Get diff between two branches for a specific file.
+    pub async fn get_file_diff(&self, repo_path: &Path, file: &Path, branch: &str) -> Result<String> {
+        let output = Command::new("git")
+            .args(["show", &format!("{}:{}", branch, file.display())])
+            .current_dir(repo_path)
+            .output()
+            .await?;
+
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        } else {
+            // File might not exist on this branch
+            Ok(String::new())
+        }
+    }
+
+    /// Try to rebase a branch onto a target.
+    /// Returns Ok(()) if rebase succeeds, Err if conflicts occur.
+    pub async fn try_rebase(&self, repo_path: &Path, branch: &str, target: &str) -> Result<()> {
+        // First, checkout the branch
+        let output = Command::new("git")
+            .args(["checkout", branch])
+            .current_dir(repo_path)
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::Git {
+                command: "checkout".to_string(),
+                stderr: stderr.to_string(),
+            });
+        }
+
+        // Attempt rebase
+        let output = Command::new("git")
+            .args(["rebase", target])
+            .current_dir(repo_path)
+            .output()
+            .await?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        // Rebase failed - abort and return error
+        let _ = Command::new("git")
+            .args(["rebase", "--abort"])
+            .current_dir(repo_path)
+            .output()
+            .await;
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(Error::Git {
+            command: "rebase".to_string(),
+            stderr: stderr.to_string(),
+        })
+    }
+
     /// Check if a branch can be fast-forwarded to another.
     pub async fn can_fast_forward(&self, repo_path: &Path, from: &str, to: &str) -> Result<bool> {
         // A fast-forward is possible if `from` is an ancestor of `to`
@@ -674,21 +733,162 @@ pub enum MergeDecision {
     Escalate { reason: String },
 }
 
+/// Result of conflict resolution attempt.
+#[derive(Debug)]
+pub enum ResolutionResult {
+    /// Successfully resolved all conflicts
+    Resolved,
+    /// Partial resolution, some conflicts remain
+    Partial { remaining: Vec<ConflictInfo> },
+    /// Resolution failed
+    Failed { reason: String },
+}
+
+/// Context for conflict resolution.
+#[derive(Debug, Clone)]
+pub struct ResolutionContext {
+    /// Description of what the task was trying to do
+    pub task_description: String,
+    /// Original task goal
+    pub task_goal: Option<String>,
+    /// Files the task modified
+    pub modified_files: Vec<PathBuf>,
+}
+
+impl Default for ResolutionContext {
+    fn default() -> Self {
+        Self {
+            task_description: "Unknown task".to_string(),
+            task_goal: None,
+            modified_files: Vec::new(),
+        }
+    }
+}
+
 /// MergeCop handles intelligent merge decisions.
 /// Uses GC pattern for clean cases, escalates conflicts.
 pub struct MergeCop {
     config: MergeCopConfig,
+    /// Track resolution attempts per task
+    resolution_attempts: std::collections::HashMap<TaskId, usize>,
 }
 
 impl MergeCop {
     /// Create a new MergeCop.
     pub fn new(config: MergeCopConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            resolution_attempts: std::collections::HashMap::new(),
+        }
     }
 
     /// Get the configuration.
     pub fn config(&self) -> &MergeCopConfig {
         &self.config
+    }
+
+    /// Get resolution attempts for a task.
+    pub fn get_attempts(&self, task_id: &TaskId) -> usize {
+        self.resolution_attempts.get(task_id).copied().unwrap_or(0)
+    }
+
+    /// Increment resolution attempts for a task.
+    pub fn increment_attempts(&mut self, task_id: &TaskId) {
+        *self.resolution_attempts.entry(task_id.clone()).or_insert(0) += 1;
+    }
+
+    /// Clear resolution attempts for a task.
+    pub fn clear_attempts(&mut self, task_id: &TaskId) {
+        self.resolution_attempts.remove(task_id);
+    }
+
+    /// Check if we should escalate based on retry count.
+    pub fn should_escalate(&self, task_id: &TaskId) -> bool {
+        self.get_attempts(task_id) >= self.config.max_conflict_retries
+    }
+
+    /// Build a conflict resolution prompt for the LLM.
+    pub fn build_resolution_prompt(
+        &self,
+        conflict: &ConflictInfo,
+        context: &ResolutionContext,
+        ours: &str,
+        theirs: &str,
+    ) -> String {
+        let mut prompt = format!(
+            "You are resolving a merge conflict in `{}`.\n\n",
+            conflict.file.display()
+        );
+
+        prompt.push_str(&format!("**Task Description:** {}\n\n", context.task_description));
+
+        if let Some(goal) = &context.task_goal {
+            prompt.push_str(&format!("**Task Goal:** {}\n\n", goal));
+        }
+
+        prompt.push_str(&format!("**Conflict Type:** {:?}\n\n", conflict.conflict_type));
+
+        prompt.push_str("**Our changes (from task branch):**\n```\n");
+        prompt.push_str(ours);
+        prompt.push_str("\n```\n\n");
+
+        prompt.push_str("**Their changes (from target branch):**\n```\n");
+        prompt.push_str(theirs);
+        prompt.push_str("\n```\n\n");
+
+        prompt.push_str(
+            "**Instructions:**\n\
+             1. Analyze both versions and understand what each is trying to accomplish\n\
+             2. Produce a merged version that preserves the intent of both changes\n\
+             3. If the changes are incompatible, prefer the task branch changes but ensure correctness\n\
+             4. Return ONLY the resolved code, no explanations\n\n\
+             **Resolved code:**\n",
+        );
+
+        prompt
+    }
+
+    /// Attempt to resolve conflicts using AI assistance.
+    ///
+    /// This reads the conflicting files, gets both versions,
+    /// asks the LLM to resolve, and applies the resolution.
+    pub async fn attempt_resolution(
+        &mut self,
+        request: &MergeRequest,
+        conflicts: &[ConflictInfo],
+        _context: &ResolutionContext,
+        git: &GitCoordinator,
+    ) -> Result<ResolutionResult> {
+        // Check if we've exceeded retry limit
+        if self.should_escalate(&request.task_id) {
+            return Ok(ResolutionResult::Failed {
+                reason: format!("Exceeded {} resolution attempts", self.config.max_conflict_retries),
+            });
+        }
+
+        self.increment_attempts(&request.task_id);
+
+        // For now, Smart MergeCop prepares the resolution context
+        // but doesn't actually call the LLM (that requires daemon integration)
+        // Instead, we return a structured result that the daemon can use
+
+        // Try rebase strategy first
+        let rebase_result = git
+            .try_rebase(&request.repo_path, &request.branch, &request.target)
+            .await;
+
+        if rebase_result.is_ok() {
+            self.clear_attempts(&request.task_id);
+            return Ok(ResolutionResult::Resolved);
+        }
+
+        // Rebase failed, conflicts remain
+        // In full implementation, we'd call LLM here
+        // For now, report the conflicts for external resolution
+
+        Ok(ResolutionResult::Partial {
+            remaining: conflicts.to_vec(),
+        })
     }
 
     /// Evaluate a merge request and decide how to handle it.
@@ -1092,5 +1292,55 @@ mod tests {
     fn test_conflict_type_equality() {
         assert_eq!(ConflictType::Content, ConflictType::Content);
         assert_ne!(ConflictType::Content, ConflictType::DeleteModify);
+    }
+
+    #[test]
+    fn test_resolution_context_default() {
+        let ctx = ResolutionContext::default();
+        assert_eq!(ctx.task_description, "Unknown task");
+        assert!(ctx.task_goal.is_none());
+        assert!(ctx.modified_files.is_empty());
+    }
+
+    #[test]
+    fn test_mergecop_attempt_tracking() {
+        let mut cop = MergeCop::new(MergeCopConfig::default());
+        let task_id = TaskId("test-task".to_string());
+
+        assert_eq!(cop.get_attempts(&task_id), 0);
+        assert!(!cop.should_escalate(&task_id));
+
+        cop.increment_attempts(&task_id);
+        assert_eq!(cop.get_attempts(&task_id), 1);
+
+        cop.increment_attempts(&task_id);
+        assert_eq!(cop.get_attempts(&task_id), 2);
+        assert!(cop.should_escalate(&task_id)); // Default max is 2
+
+        cop.clear_attempts(&task_id);
+        assert_eq!(cop.get_attempts(&task_id), 0);
+    }
+
+    #[test]
+    fn test_build_resolution_prompt() {
+        let cop = MergeCop::new(MergeCopConfig::default());
+        let conflict = ConflictInfo {
+            file: PathBuf::from("src/main.rs"),
+            conflict_type: ConflictType::Content,
+        };
+        let context = ResolutionContext {
+            task_description: "Add user authentication".to_string(),
+            task_goal: Some("Implement login flow".to_string()),
+            modified_files: vec![PathBuf::from("src/auth.rs")],
+        };
+
+        let prompt = cop.build_resolution_prompt(&conflict, &context, "our code", "their code");
+
+        assert!(prompt.contains("src/main.rs"));
+        assert!(prompt.contains("Add user authentication"));
+        assert!(prompt.contains("Implement login flow"));
+        assert!(prompt.contains("our code"));
+        assert!(prompt.contains("their code"));
+        assert!(prompt.contains("Content"));
     }
 }

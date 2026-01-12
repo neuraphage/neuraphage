@@ -58,5 +58,5 @@ pub use sandbox::{SandboxAvailability, SandboxConfig, SandboxMode};
 // Re-export git types
 pub use git::{
     ConflictInfo, ConflictType, GitCoordinator, MergeCop, MergeCopConfig, MergeDecision, MergeQueue, MergeRequest,
-    MergeResult, ReconcileResult, WorktreeInfo, WorktreeRegistry,
+    MergeResult, ReconcileResult, ResolutionContext, ResolutionResult, WorktreeInfo, WorktreeRegistry,
 };
