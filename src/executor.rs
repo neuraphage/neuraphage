@@ -669,6 +669,11 @@ impl TaskExecutor {
         self.running_tasks.get(task_id).map(|r| &r.state)
     }
 
+    /// Get execution states for all running tasks.
+    pub fn get_all_states(&self) -> Vec<&ExecutionState> {
+        self.running_tasks.values().map(|r| &r.state).collect()
+    }
+
     /// Poll for events from a task.
     ///
     /// This drains new events from the channel, updates state from them,

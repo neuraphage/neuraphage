@@ -203,6 +203,13 @@ pub enum DaemonRequest {
     TriggerRebase { id: String },
     /// Shutdown daemon.
     Shutdown,
+    // -- TUI-specific requests --
+    /// Subscribe to events from all tasks (for parallel TUI).
+    SubscribeAllTasks,
+    /// Get execution status for all running tasks.
+    GetAllExecutionStatus,
+    /// Get current budget status from CostTracker.
+    GetBudgetStatus,
 }
 
 /// Response from the daemon.
@@ -267,6 +274,22 @@ pub enum DaemonResponse {
     },
     /// Shutdown acknowledgment.
     Shutdown,
+    // -- TUI-specific responses --
+    /// All execution events from all tasks (for parallel TUI subscription).
+    AllExecutionEvents {
+        events: Vec<(String, ExecutionEventDto)>, // (task_id, event)
+    },
+    /// All execution statuses for running tasks.
+    AllExecutionStatus {
+        statuses: Vec<(String, ExecutionStatusDto)>, // (task_id, status)
+    },
+    /// Current budget status.
+    BudgetStatusResponse {
+        daily_used: f64,
+        daily_limit: Option<f64>,
+        monthly_used: f64,
+        monthly_limit: Option<f64>,
+    },
 }
 
 /// DTO for activity (serializable version of Activity).
@@ -547,9 +570,10 @@ impl Daemon {
                             let manager = Arc::clone(&self.manager);
                             let supervised_executor = Arc::clone(&self.supervised_executor);
                             let merge_queue = Arc::clone(&self.merge_queue);
+                            let cost_tracker = Arc::clone(&self.cost_tracker);
                             let shutdown_tx = self.shutdown.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection(stream, manager, supervised_executor, merge_queue, shutdown_tx).await {
+                                if let Err(e) = handle_connection(stream, manager, supervised_executor, merge_queue, cost_tracker, shutdown_tx).await {
                                     log::error!("Connection error: {}", e);
                                 }
                             });
@@ -741,6 +765,7 @@ async fn handle_connection(
     manager: Arc<Mutex<TaskManager>>,
     supervised_executor: Arc<SupervisedExecutor>,
     merge_queue: Arc<Mutex<MergeQueue>>,
+    cost_tracker: Arc<crate::cost::CostTracker>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
@@ -749,7 +774,15 @@ async fn handle_connection(
 
     while reader.read_line(&mut line).await? > 0 {
         let request: DaemonRequest = serde_json::from_str(&line)?;
-        let response = process_request(request, &manager, &supervised_executor, &merge_queue, &shutdown_tx).await;
+        let response = process_request(
+            request,
+            &manager,
+            &supervised_executor,
+            &merge_queue,
+            &cost_tracker,
+            &shutdown_tx,
+        )
+        .await;
 
         let response_json = serde_json::to_string(&response)?;
         writer.write_all(response_json.as_bytes()).await?;
@@ -772,6 +805,7 @@ async fn process_request(
     manager: &Arc<Mutex<TaskManager>>,
     supervised_executor: &Arc<SupervisedExecutor>,
     merge_queue: &Arc<Mutex<MergeQueue>>,
+    cost_tracker: &Arc<crate::cost::CostTracker>,
     shutdown_tx: &tokio::sync::broadcast::Sender<()>,
 ) -> DaemonResponse {
     match request {
@@ -1248,6 +1282,50 @@ async fn process_request(
         DaemonRequest::Shutdown => {
             let _ = shutdown_tx.send(());
             DaemonResponse::Shutdown
+        }
+
+        // -- TUI-specific request handlers --
+        DaemonRequest::SubscribeAllTasks => {
+            // Poll events from all running tasks
+            let mut exec = supervised_executor.executor().lock().await;
+            let task_ids = exec.running_task_ids();
+            let mut all_events = Vec::new();
+
+            for task_id in task_ids {
+                if let Ok(events) = exec.poll_events(&task_id) {
+                    // Update heartbeat for supervision
+                    drop(exec);
+                    supervised_executor.update_heartbeat(&task_id, &events).await;
+                    exec = supervised_executor.executor().lock().await;
+
+                    for event in events {
+                        all_events.push((task_id.0.clone(), event.into()));
+                    }
+                }
+            }
+
+            DaemonResponse::AllExecutionEvents { events: all_events }
+        }
+
+        DaemonRequest::GetAllExecutionStatus => {
+            let exec = supervised_executor.executor().lock().await;
+            let statuses: Vec<(String, ExecutionStatusDto)> = exec
+                .get_all_states()
+                .into_iter()
+                .map(|state| (state.task_id.0.clone(), (&state.status).into()))
+                .collect();
+
+            DaemonResponse::AllExecutionStatus { statuses }
+        }
+
+        DaemonRequest::GetBudgetStatus => {
+            let stats = cost_tracker.get_stats().await;
+            DaemonResponse::BudgetStatusResponse {
+                daily_used: stats.daily_used,
+                daily_limit: stats.daily_limit,
+                monthly_used: stats.monthly_used,
+                monthly_limit: stats.monthly_limit,
+            }
         }
     }
 }
