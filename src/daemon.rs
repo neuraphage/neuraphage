@@ -43,6 +43,27 @@ impl From<&WorktreeInfo> for WorktreeInfoDto {
     }
 }
 
+/// DTO for recoverable task info.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoverableTaskDto {
+    /// Task ID.
+    pub task_id: String,
+    /// Iteration the task was on.
+    pub iteration: u32,
+    /// Tokens used when checkpointed.
+    pub tokens_used: u64,
+    /// Cost when checkpointed.
+    pub cost: f64,
+    /// Phase of execution.
+    pub phase: String,
+    /// Working directory.
+    pub working_dir: String,
+    /// When the checkpoint was taken.
+    pub checkpoint_at: String,
+    /// Why the task was started.
+    pub started_reason: String,
+}
+
 /// Daemon configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonConfig {
@@ -149,6 +170,10 @@ pub enum DaemonRequest {
     MergeQueueStatus,
     /// Enqueue a task for merging.
     EnqueueMerge { id: String, target_branch: Option<String> },
+    /// Get recovery report (tasks that were running when daemon crashed).
+    GetRecoveryReport,
+    /// Resume a task from its last checkpoint.
+    ResumeTask { id: String },
     /// Shutdown daemon.
     Shutdown,
 }
@@ -201,6 +226,10 @@ pub enum DaemonResponse {
     MergeQueueStatusResponse { pending: usize, active: Option<String> },
     /// Task enqueued for merge.
     MergeEnqueued { task_id: String },
+    /// Recovery report response.
+    RecoveryReport { tasks: Vec<RecoverableTaskDto> },
+    /// Task resumed from checkpoint.
+    TaskResumed { task_id: String },
     /// Shutdown acknowledgment.
     Shutdown,
 }
@@ -392,6 +421,9 @@ impl Daemon {
         // Write PID file
         std::fs::write(&self.config.pid_path, std::process::id().to_string())?;
 
+        // Check for recoverable tasks from previous session
+        let _ = self.recover().await;
+
         // Spawn supervision loops if enabled
         let _watcher_handle = if self.config.supervision_enabled {
             log::info!("Starting supervision loops (watcher + syncer)");
@@ -456,6 +488,45 @@ impl Daemon {
             std::fs::remove_file(&self.config.pid_path)?;
         }
         Ok(())
+    }
+
+    /// Check for recoverable tasks on startup.
+    ///
+    /// Returns the list of tasks that were running when the daemon crashed.
+    /// These tasks can be resumed using the ResumeTask request.
+    pub async fn recover(&self) -> Result<Vec<RecoverableTaskDto>> {
+        let exec = self.supervised_executor.executor().lock().await;
+        let states = exec.state_store().list_all().await?;
+
+        let tasks: Vec<RecoverableTaskDto> = states
+            .into_iter()
+            .map(|s| RecoverableTaskDto {
+                task_id: s.task_id,
+                iteration: s.iteration,
+                tokens_used: s.tokens_used,
+                cost: s.cost,
+                phase: s.phase,
+                working_dir: s.working_dir.to_string_lossy().to_string(),
+                checkpoint_at: s.checkpoint_at.to_rfc3339(),
+                started_reason: s.started_reason,
+            })
+            .collect();
+
+        if !tasks.is_empty() {
+            log::warn!("Found {} recoverable task(s) from previous session:", tasks.len());
+            for task in &tasks {
+                log::warn!(
+                    "  - {} (iteration {}, phase {}, checkpoint {})",
+                    task.task_id,
+                    task.iteration,
+                    task.phase,
+                    task.checkpoint_at
+                );
+            }
+            log::warn!("Use 'np recover' to see recovery report and 'np resume <id>' to resume");
+        }
+
+        Ok(tasks)
     }
 
     /// Spawn the completion handler loop.
@@ -913,6 +984,79 @@ async fn process_request(
             queue.enqueue(request);
 
             DaemonResponse::MergeEnqueued { task_id: id }
+        }
+
+        DaemonRequest::GetRecoveryReport => {
+            // List all persisted execution states (tasks that were running when daemon crashed)
+            let exec = supervised_executor.executor().lock().await;
+            match exec.state_store().list_all().await {
+                Ok(states) => {
+                    let tasks: Vec<RecoverableTaskDto> = states
+                        .into_iter()
+                        .map(|s| RecoverableTaskDto {
+                            task_id: s.task_id,
+                            iteration: s.iteration,
+                            tokens_used: s.tokens_used,
+                            cost: s.cost,
+                            phase: s.phase,
+                            working_dir: s.working_dir.to_string_lossy().to_string(),
+                            checkpoint_at: s.checkpoint_at.to_rfc3339(),
+                            started_reason: s.started_reason,
+                        })
+                        .collect();
+                    DaemonResponse::RecoveryReport { tasks }
+                }
+                Err(e) => DaemonResponse::Error { message: e.to_string() },
+            }
+        }
+
+        DaemonRequest::ResumeTask { id } => {
+            let task_id = TaskId::from_engram_id(&id);
+
+            // Check if there's persisted state for this task
+            let exec = supervised_executor.executor().lock().await;
+            let state = match exec.state_store().load(&id).await {
+                Ok(Some(state)) => state,
+                Ok(None) => {
+                    return DaemonResponse::Error {
+                        message: format!("No checkpoint found for task: {}", id),
+                    };
+                }
+                Err(e) => {
+                    return DaemonResponse::Error { message: e.to_string() };
+                }
+            };
+            drop(exec);
+
+            // Get the task from TaskManager
+            let task = {
+                let mgr = manager.lock().await;
+                match mgr.get_task(&task_id) {
+                    Ok(Some(task)) => task,
+                    Ok(None) => {
+                        return DaemonResponse::Error {
+                            message: format!("Task not found in TaskManager: {}", id),
+                        };
+                    }
+                    Err(e) => {
+                        return DaemonResponse::Error { message: e.to_string() };
+                    }
+                }
+            };
+
+            // Resume the task from its working directory
+            let working_dir = Some(state.working_dir);
+
+            // Start execution through supervised executor
+            match supervised_executor.start_task(task, working_dir).await {
+                Ok(()) => {
+                    // Update task status to Running
+                    let mut mgr = manager.lock().await;
+                    let _ = mgr.set_status(&task_id, TaskStatus::Running);
+                    DaemonResponse::TaskResumed { task_id: id }
+                }
+                Err(e) => DaemonResponse::Error { message: e.to_string() },
+            }
         }
 
         DaemonRequest::Shutdown => {
