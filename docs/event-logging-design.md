@@ -2,7 +2,7 @@
 
 **Author:** Scott Aidler
 **Date:** 2026-01-11
-**Status:** Ready for Implementation
+**Status:** Superseded by engram-events-design.md
 **Review Passes:** 5/5
 
 ## Summary
