@@ -14,12 +14,14 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::coordination::{EventBus, KnowledgeStore};
+use crate::coordination::{Knowledge, KnowledgeKind};
 use crate::error::{Error, Result};
 use crate::executor::{
     ExecutionEvent, ExecutionStatus, ExecutorConfig, InjectedMessage, NudgeSeverity, SyncUrgency, TaskExecutor,
 };
 use crate::personas::{
-    SyncMessage, Syncer, SyncerConfig, TaskSnapshot, WatchResult, Watcher, WatcherConfig, WatcherRecommendation,
+    SyncMessage, Syncer, SyncerConfig, TaskSnapshot, TaskSummary, WatchResult, Watcher, WatcherConfig,
+    WatcherRecommendation,
 };
 use crate::task::{Task, TaskId};
 
@@ -129,14 +131,26 @@ pub struct SupervisionHealth {
     pub tasks_paused: u64,
 }
 
+/// Metadata for a running task.
+#[derive(Debug, Clone)]
+pub struct TaskMetadata {
+    /// Task description.
+    pub description: String,
+    /// Task tags.
+    pub tags: Vec<String>,
+    /// Working directory.
+    pub working_dir: Option<std::path::PathBuf>,
+    /// Parent task if subtask.
+    pub parent_task: Option<TaskId>,
+}
+
 /// SupervisedExecutor wraps TaskExecutor with Watcher and Syncer supervision.
 pub struct SupervisedExecutor {
     /// The underlying task executor.
     executor: Arc<Mutex<TaskExecutor>>,
     /// Watcher for stuck detection.
     watcher: Watcher,
-    /// Syncer for cross-task learning (used in Phase 3).
-    #[allow(dead_code)]
+    /// Syncer for cross-task learning.
     syncer: Arc<Mutex<Syncer>>,
     /// Knowledge store for learnings.
     knowledge: Arc<KnowledgeStore>,
@@ -152,6 +166,8 @@ pub struct SupervisedExecutor {
     health: Arc<RwLock<SupervisionHealth>>,
     /// Task start times for debouncing.
     task_start_times: Arc<RwLock<HashMap<TaskId, DateTime<Utc>>>>,
+    /// Task metadata for syncer summaries.
+    task_metadata: Arc<RwLock<HashMap<TaskId, TaskMetadata>>>,
 }
 
 impl SupervisedExecutor {
@@ -170,6 +186,7 @@ impl SupervisedExecutor {
             last_snapshots: Arc::new(RwLock::new(HashMap::new())),
             health: Arc::new(RwLock::new(SupervisionHealth::default())),
             task_start_times: Arc::new(RwLock::new(HashMap::new())),
+            task_metadata: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -193,6 +210,7 @@ impl SupervisedExecutor {
             last_snapshots: Arc::new(RwLock::new(HashMap::new())),
             health: Arc::new(RwLock::new(SupervisionHealth::default())),
             task_start_times: Arc::new(RwLock::new(HashMap::new())),
+            task_metadata: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -219,11 +237,13 @@ impl SupervisedExecutor {
     /// Start a task through the supervised executor.
     pub async fn start_task(&self, task: Task, working_dir: Option<std::path::PathBuf>) -> Result<()> {
         let task_id = task.id.clone();
+        let description = task.description.clone();
+        let tags = task.tags.clone();
 
         // Start the task in the underlying executor
         {
             let mut executor = self.executor.lock().await;
-            executor.start_task(task, working_dir)?;
+            executor.start_task(task, working_dir.clone())?;
         }
 
         // Track start time for debouncing
@@ -235,7 +255,21 @@ impl SupervisedExecutor {
         // Initialize heartbeat
         {
             let mut heartbeats = self.heartbeats.write().await;
-            heartbeats.insert(task_id, TaskHeartbeat::default());
+            heartbeats.insert(task_id.clone(), TaskHeartbeat::default());
+        }
+
+        // Store task metadata for syncer
+        {
+            let mut metadata = self.task_metadata.write().await;
+            metadata.insert(
+                task_id,
+                TaskMetadata {
+                    description,
+                    tags,
+                    working_dir,
+                    parent_task: None,
+                },
+            );
         }
 
         Ok(())
@@ -615,6 +649,208 @@ impl SupervisedExecutor {
         }
     }
 
+    /// Spawn the syncer supervision loop.
+    pub fn spawn_syncer_loop(self: &Arc<Self>) -> JoinHandle<()> {
+        let this = Arc::clone(self);
+        let syncer_config = this.config.syncer.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(syncer_config.interval());
+            loop {
+                interval.tick().await;
+
+                if !this.config.supervision_enabled || !syncer_config.enabled {
+                    continue;
+                }
+
+                if let Err(e) = this.run_syncer_cycle_safe().await {
+                    error!("Syncer cycle error: {}", e);
+                }
+            }
+        })
+    }
+
+    /// Run syncer cycle with error handling.
+    async fn run_syncer_cycle_safe(&self) -> Result<()> {
+        match self.run_syncer_cycle().await {
+            Ok(()) => {
+                let mut health = self.health.write().await;
+                health.syncer_healthy = true;
+                health.last_syncer_cycle = Some(Utc::now());
+                health.syncer_cycles += 1;
+                Ok(())
+            }
+            Err(e) => {
+                warn!("Syncer cycle failed: {}", e);
+                Ok(()) // Syncer failures are non-fatal
+            }
+        }
+    }
+
+    /// Run a full syncer cycle.
+    async fn run_syncer_cycle(&self) -> Result<()> {
+        // Get all running task IDs
+        let task_ids = {
+            let executor = self.executor.lock().await;
+            executor.running_task_ids()
+        };
+
+        if task_ids.len() < 2 {
+            // Need at least 2 tasks for syncing
+            return Ok(());
+        }
+
+        debug!("Syncer cycle: {} running tasks", task_ids.len());
+
+        // Build task summaries
+        let task_summaries = self.build_task_summaries(&task_ids).await;
+
+        // Process learnings from the knowledge store
+        // Get recent learnings (using search with empty query to get all)
+        let learnings = self.knowledge.search("").await;
+
+        // Only process recent learnings (last 10)
+        for learning in learnings.into_iter().take(10) {
+            if let Some(source_task_id) = &learning.source_task {
+                let source_summary = task_summaries.iter().find(|t| &t.task_id == source_task_id);
+
+                if let Some(source) = source_summary {
+                    // Evaluate who should receive this learning
+                    let mut syncer = self.syncer.lock().await;
+                    let result = syncer.evaluate_learning(source, &learning, &task_summaries);
+
+                    // Deliver to recipients
+                    for msg in result.recipients {
+                        if let Err(e) = self.inject_sync(&msg.target_task, &msg).await {
+                            warn!("Failed to inject sync to {}: {}", msg.target_task.0, e);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Build task summaries for syncer evaluation.
+    async fn build_task_summaries(&self, task_ids: &[TaskId]) -> Vec<TaskSummary> {
+        let metadata = self.task_metadata.read().await;
+        let heartbeats = self.heartbeats.read().await;
+
+        task_ids
+            .iter()
+            .filter_map(|id| {
+                let meta = metadata.get(id)?;
+                let hb = heartbeats.get(id);
+
+                Some(TaskSummary {
+                    task_id: id.clone(),
+                    description: meta.description.clone(),
+                    tags: meta.tags.clone(),
+                    current_focus: hb.map(|h| h.last_tool.clone().unwrap_or_default()).unwrap_or_default(),
+                    recent_learnings: Vec::new(), // Populated separately
+                    working_directory: meta.working_dir.as_ref().map(|p| p.display().to_string()),
+                    parent_task: meta.parent_task.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Extract learnings from tool results.
+    ///
+    /// Looks for patterns that indicate discoveries:
+    /// - File operations that reveal structure
+    /// - Error messages that indicate gotchas
+    /// - Success patterns that could help others
+    pub fn extract_learnings(&self, task_id: &TaskId, events: &[ExecutionEvent]) -> Vec<Knowledge> {
+        let mut learnings = Vec::new();
+
+        for event in events {
+            match event {
+                ExecutionEvent::ToolCompleted { name, result } => {
+                    // Extract learnings from specific tool results
+                    if let Some(learning) = self.extract_learning_from_tool(task_id, name, result) {
+                        learnings.push(learning);
+                    }
+                }
+                ExecutionEvent::Failed { error } => {
+                    // Errors are often valuable learnings
+                    let learning = Knowledge::new(
+                        KnowledgeKind::ErrorResolution,
+                        format!("Task encountered error: {}", error),
+                        error,
+                    )
+                    .from_task(task_id.clone())
+                    .with_relevance(0.8);
+                    learnings.push(learning);
+                }
+                _ => {}
+            }
+        }
+
+        learnings
+    }
+
+    /// Extract learning from a specific tool result.
+    fn extract_learning_from_tool(&self, task_id: &TaskId, tool_name: &str, result: &str) -> Option<Knowledge> {
+        // Look for significant patterns
+        match tool_name {
+            "read_file" | "glob" | "grep" => {
+                // File discovery - potentially useful to others
+                if result.contains("found") || result.contains("matches") {
+                    let learning = Knowledge::new(
+                        KnowledgeKind::Fact,
+                        format!("File discovery via {}: {}", tool_name, truncate(result, 100)),
+                        result,
+                    )
+                    .from_task(task_id.clone())
+                    .with_tags(vec!["file-discovery".to_string()]);
+                    return Some(learning);
+                }
+            }
+            "bash" => {
+                // Command results - errors are especially valuable
+                if result.contains("error") || result.contains("Error") || result.contains("failed") {
+                    let learning = Knowledge::new(
+                        KnowledgeKind::ErrorResolution,
+                        format!("Command error: {}", truncate(result, 100)),
+                        result,
+                    )
+                    .from_task(task_id.clone())
+                    .with_relevance(0.9)
+                    .with_tags(vec!["command-error".to_string()]);
+                    return Some(learning);
+                }
+            }
+            "write_file" | "edit_file" => {
+                // File changes - note what was modified
+                let learning = Knowledge::new(
+                    KnowledgeKind::Fact,
+                    format!("File modification via {}", tool_name),
+                    result,
+                )
+                .from_task(task_id.clone())
+                .with_tags(vec!["file-change".to_string()]);
+                return Some(learning);
+            }
+            _ => {}
+        }
+
+        None
+    }
+
+    /// Record a learning from a task.
+    pub async fn record_learning(&self, learning: Knowledge) {
+        let _ = self.knowledge.store(learning).await;
+    }
+
+    /// Process and record learnings from events.
+    pub async fn process_events_for_learnings(&self, task_id: &TaskId, events: &[ExecutionEvent]) {
+        let learnings = self.extract_learnings(task_id, events);
+        for learning in learnings {
+            self.record_learning(learning).await;
+        }
+    }
+
     /// Clean up after task completion.
     pub async fn cleanup_task(&self, task_id: &TaskId) {
         // Remove heartbeat
@@ -634,7 +870,18 @@ impl SupervisedExecutor {
             let mut start_times = self.task_start_times.write().await;
             start_times.remove(task_id);
         }
+
+        // Remove task metadata
+        {
+            let mut metadata = self.task_metadata.write().await;
+            metadata.remove(task_id);
+        }
     }
+}
+
+/// Truncate a string for display.
+fn truncate(s: &str, max_len: usize) -> &str {
+    if s.len() <= max_len { s } else { &s[..max_len] }
 }
 
 #[cfg(test)]
