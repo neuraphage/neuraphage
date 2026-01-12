@@ -29,6 +29,8 @@ pub struct Config {
     pub sandbox: SandboxSettings,
     /// Budget and cost control settings.
     pub budget: BudgetSettings,
+    /// TUI configuration.
+    pub tui: TuiSettings,
     /// Model pricing (override defaults).
     #[serde(default = "default_model_pricing")]
     pub model_pricing: ModelPricingMap,
@@ -49,6 +51,7 @@ impl Default for Config {
             api: ApiSettings::default(),
             sandbox: SandboxSettings::default(),
             budget: BudgetSettings::default(),
+            tui: TuiSettings::default(),
             model_pricing: default_model_pricing(),
         }
     }
@@ -229,6 +232,72 @@ pub enum BudgetAction {
     Pause,
     /// Reject new tasks but allow running to complete.
     Reject,
+}
+
+/// TUI settings.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TuiSettings {
+    /// Default layout mode for parallel TUI.
+    #[serde(default)]
+    pub default_layout: TuiLayoutMode,
+    /// Default sort order for workstreams.
+    #[serde(default)]
+    pub default_sort: TuiSortOrder,
+    /// Render frame rate (FPS, max 60).
+    pub frame_rate: u8,
+    /// Output buffer size per workstream (lines).
+    pub output_buffer_size: usize,
+    /// Maximum timeline events to keep.
+    pub max_timeline_events: usize,
+    /// Show events strip in dashboard mode.
+    pub show_events_strip: bool,
+    /// Events strip height (lines).
+    pub events_strip_height: u16,
+}
+
+impl Default for TuiSettings {
+    fn default() -> Self {
+        Self {
+            default_layout: TuiLayoutMode::Dashboard,
+            default_sort: TuiSortOrder::Status,
+            frame_rate: 30,
+            output_buffer_size: 1000,
+            max_timeline_events: 100,
+            show_events_strip: true,
+            events_strip_height: 6,
+        }
+    }
+}
+
+/// Layout mode for TUI config (mirrors parallel_tui::LayoutMode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TuiLayoutMode {
+    /// Single primary view with sidebar (default).
+    #[default]
+    Dashboard,
+    /// Primary + secondary split view.
+    Split,
+    /// 2x2 grid of workstreams.
+    Grid,
+    /// Full-screen focus on one workstream.
+    Focus,
+}
+
+/// Sort order for TUI config (mirrors parallel_tui::SortOrder).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TuiSortOrder {
+    /// By status (running first, then waiting, etc.)
+    #[default]
+    Status,
+    /// By cost (highest first).
+    Cost,
+    /// By last activity (most recent first).
+    Activity,
+    /// By name (alphabetical).
+    Name,
 }
 
 /// Model pricing configuration (cost per million tokens).
@@ -461,5 +530,84 @@ model_pricing:
         assert!(config.model_pricing.contains_key("custom"));
         let sonnet = &config.model_pricing["sonnet"];
         assert!((sonnet.input - 3.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_tui_settings_default() {
+        let settings = TuiSettings::default();
+        assert_eq!(settings.default_layout, TuiLayoutMode::Dashboard);
+        assert_eq!(settings.default_sort, TuiSortOrder::Status);
+        assert_eq!(settings.frame_rate, 30);
+        assert_eq!(settings.output_buffer_size, 1000);
+        assert_eq!(settings.max_timeline_events, 100);
+        assert!(settings.show_events_strip);
+        assert_eq!(settings.events_strip_height, 6);
+    }
+
+    #[test]
+    fn test_config_with_tui() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("config.yml");
+
+        let config_content = r#"
+tui:
+  default_layout: split
+  default_sort: cost
+  frame_rate: 60
+  output_buffer_size: 500
+  max_timeline_events: 50
+  show_events_strip: false
+  events_strip_height: 4
+"#;
+        fs::write(&config_path, config_content).unwrap();
+
+        let config = Config::load_from_file(&config_path).unwrap();
+        assert_eq!(config.tui.default_layout, TuiLayoutMode::Split);
+        assert_eq!(config.tui.default_sort, TuiSortOrder::Cost);
+        assert_eq!(config.tui.frame_rate, 60);
+        assert_eq!(config.tui.output_buffer_size, 500);
+        assert_eq!(config.tui.max_timeline_events, 50);
+        assert!(!config.tui.show_events_strip);
+        assert_eq!(config.tui.events_strip_height, 4);
+    }
+
+    #[test]
+    fn test_tui_layout_modes() {
+        // Test all layout modes serialize/deserialize correctly
+        let temp = TempDir::new().unwrap();
+
+        for (mode_str, expected) in [
+            ("dashboard", TuiLayoutMode::Dashboard),
+            ("split", TuiLayoutMode::Split),
+            ("grid", TuiLayoutMode::Grid),
+            ("focus", TuiLayoutMode::Focus),
+        ] {
+            let config_path = temp.path().join(format!("config_{}.yml", mode_str));
+            let config_content = format!("tui:\n  default_layout: {}", mode_str);
+            fs::write(&config_path, config_content).unwrap();
+
+            let config = Config::load_from_file(&config_path).unwrap();
+            assert_eq!(config.tui.default_layout, expected, "Failed for {}", mode_str);
+        }
+    }
+
+    #[test]
+    fn test_tui_sort_orders() {
+        // Test all sort orders serialize/deserialize correctly
+        let temp = TempDir::new().unwrap();
+
+        for (sort_str, expected) in [
+            ("status", TuiSortOrder::Status),
+            ("cost", TuiSortOrder::Cost),
+            ("activity", TuiSortOrder::Activity),
+            ("name", TuiSortOrder::Name),
+        ] {
+            let config_path = temp.path().join(format!("config_{}.yml", sort_str));
+            let config_content = format!("tui:\n  default_sort: {}", sort_str);
+            fs::write(&config_path, config_content).unwrap();
+
+            let config = Config::load_from_file(&config_path).unwrap();
+            assert_eq!(config.tui.default_sort, expected, "Failed for {}", sort_str);
+        }
     }
 }

@@ -22,6 +22,7 @@ use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap};
 
+use crate::config::{TuiLayoutMode, TuiSettings, TuiSortOrder};
 use crate::error::Result;
 use crate::task::{TaskId, TaskStatus};
 use crate::ui::notifications::Notification;
@@ -43,6 +44,28 @@ pub enum LayoutMode {
     Focus,
 }
 
+impl From<TuiLayoutMode> for LayoutMode {
+    fn from(mode: TuiLayoutMode) -> Self {
+        match mode {
+            TuiLayoutMode::Dashboard => LayoutMode::Dashboard,
+            TuiLayoutMode::Split => LayoutMode::Split,
+            TuiLayoutMode::Grid => LayoutMode::Grid,
+            TuiLayoutMode::Focus => LayoutMode::Focus,
+        }
+    }
+}
+
+impl From<LayoutMode> for TuiLayoutMode {
+    fn from(mode: LayoutMode) -> Self {
+        match mode {
+            LayoutMode::Dashboard => TuiLayoutMode::Dashboard,
+            LayoutMode::Split => TuiLayoutMode::Split,
+            LayoutMode::Grid => TuiLayoutMode::Grid,
+            LayoutMode::Focus => TuiLayoutMode::Focus,
+        }
+    }
+}
+
 /// Sort order for workstream list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortOrder {
@@ -55,6 +78,28 @@ pub enum SortOrder {
     Activity,
     /// By name (alphabetical).
     Name,
+}
+
+impl From<TuiSortOrder> for SortOrder {
+    fn from(order: TuiSortOrder) -> Self {
+        match order {
+            TuiSortOrder::Status => SortOrder::Status,
+            TuiSortOrder::Cost => SortOrder::Cost,
+            TuiSortOrder::Activity => SortOrder::Activity,
+            TuiSortOrder::Name => SortOrder::Name,
+        }
+    }
+}
+
+impl From<SortOrder> for TuiSortOrder {
+    fn from(order: SortOrder) -> Self {
+        match order {
+            SortOrder::Status => TuiSortOrder::Status,
+            SortOrder::Cost => TuiSortOrder::Cost,
+            SortOrder::Activity => TuiSortOrder::Activity,
+            SortOrder::Name => TuiSortOrder::Name,
+        }
+    }
 }
 
 /// Connection status to daemon.
@@ -367,23 +412,38 @@ impl Default for ParallelTuiState {
 }
 
 impl ParallelTuiState {
-    /// Create a new parallel TUI state.
+    /// Create a new parallel TUI state with default settings.
     pub fn new() -> Self {
+        Self::from_settings(&TuiSettings::default())
+    }
+
+    /// Create a new parallel TUI state from config settings.
+    pub fn from_settings(settings: &TuiSettings) -> Self {
         Self {
             workstreams: Vec::new(),
             primary_focus: 0,
             secondary_focus: None,
-            layout_mode: LayoutMode::Dashboard,
-            event_timeline: VecDeque::with_capacity(100),
+            layout_mode: settings.default_layout.into(),
+            event_timeline: VecDeque::with_capacity(settings.max_timeline_events),
             stats: GlobalStats::default(),
             budget: BudgetStatus::default(),
             notifications: VecDeque::with_capacity(50),
             show_help: false,
             filter: WorkstreamFilter::default(),
-            sort_order: SortOrder::Status,
+            sort_order: settings.default_sort.into(),
             connection_status: ConnectionStatus::Connected,
-            max_timeline_events: 100,
+            max_timeline_events: settings.max_timeline_events,
         }
+    }
+
+    /// Get the current layout as a config type (for persistence).
+    pub fn layout_as_config(&self) -> TuiLayoutMode {
+        self.layout_mode.into()
+    }
+
+    /// Get the current sort order as a config type (for persistence).
+    pub fn sort_order_as_config(&self) -> TuiSortOrder {
+        self.sort_order.into()
     }
 
     /// Add a workstream.
@@ -590,10 +650,18 @@ impl Default for ParallelTuiApp {
 }
 
 impl ParallelTuiApp {
-    /// Create a new parallel TUI app.
+    /// Create a new parallel TUI app with default settings.
     pub fn new() -> Self {
         Self {
             state: ParallelTuiState::new(),
+            should_quit: false,
+        }
+    }
+
+    /// Create a new parallel TUI app from config settings.
+    pub fn from_settings(settings: &TuiSettings) -> Self {
+        Self {
+            state: ParallelTuiState::from_settings(settings),
             should_quit: false,
         }
     }
@@ -1325,5 +1393,82 @@ mod tests {
         // Test quit
         app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn test_from_tui_settings() {
+        let settings = TuiSettings {
+            default_layout: TuiLayoutMode::Split,
+            default_sort: TuiSortOrder::Cost,
+            max_timeline_events: 50,
+            ..Default::default()
+        };
+
+        let state = ParallelTuiState::from_settings(&settings);
+        assert_eq!(state.layout_mode, LayoutMode::Split);
+        assert_eq!(state.sort_order, SortOrder::Cost);
+        assert_eq!(state.max_timeline_events, 50);
+    }
+
+    #[test]
+    fn test_layout_mode_conversion() {
+        // Test From<TuiLayoutMode> for LayoutMode
+        assert_eq!(LayoutMode::from(TuiLayoutMode::Dashboard), LayoutMode::Dashboard);
+        assert_eq!(LayoutMode::from(TuiLayoutMode::Split), LayoutMode::Split);
+        assert_eq!(LayoutMode::from(TuiLayoutMode::Grid), LayoutMode::Grid);
+        assert_eq!(LayoutMode::from(TuiLayoutMode::Focus), LayoutMode::Focus);
+
+        // Test From<LayoutMode> for TuiLayoutMode
+        assert_eq!(TuiLayoutMode::from(LayoutMode::Dashboard), TuiLayoutMode::Dashboard);
+        assert_eq!(TuiLayoutMode::from(LayoutMode::Split), TuiLayoutMode::Split);
+        assert_eq!(TuiLayoutMode::from(LayoutMode::Grid), TuiLayoutMode::Grid);
+        assert_eq!(TuiLayoutMode::from(LayoutMode::Focus), TuiLayoutMode::Focus);
+    }
+
+    #[test]
+    fn test_sort_order_conversion() {
+        // Test From<TuiSortOrder> for SortOrder
+        assert_eq!(SortOrder::from(TuiSortOrder::Status), SortOrder::Status);
+        assert_eq!(SortOrder::from(TuiSortOrder::Cost), SortOrder::Cost);
+        assert_eq!(SortOrder::from(TuiSortOrder::Activity), SortOrder::Activity);
+        assert_eq!(SortOrder::from(TuiSortOrder::Name), SortOrder::Name);
+
+        // Test From<SortOrder> for TuiSortOrder
+        assert_eq!(TuiSortOrder::from(SortOrder::Status), TuiSortOrder::Status);
+        assert_eq!(TuiSortOrder::from(SortOrder::Cost), TuiSortOrder::Cost);
+        assert_eq!(TuiSortOrder::from(SortOrder::Activity), TuiSortOrder::Activity);
+        assert_eq!(TuiSortOrder::from(SortOrder::Name), TuiSortOrder::Name);
+    }
+
+    #[test]
+    fn test_layout_as_config() {
+        let mut state = ParallelTuiState::new();
+        assert_eq!(state.layout_as_config(), TuiLayoutMode::Dashboard);
+
+        state.toggle_layout(LayoutMode::Grid);
+        assert_eq!(state.layout_as_config(), TuiLayoutMode::Grid);
+    }
+
+    #[test]
+    fn test_sort_order_as_config() {
+        let mut state = ParallelTuiState::new();
+        assert_eq!(state.sort_order_as_config(), TuiSortOrder::Status);
+
+        state.cycle_sort_order();
+        assert_eq!(state.sort_order_as_config(), TuiSortOrder::Cost);
+    }
+
+    #[test]
+    fn test_app_from_settings() {
+        let settings = TuiSettings {
+            default_layout: TuiLayoutMode::Focus,
+            default_sort: TuiSortOrder::Activity,
+            ..Default::default()
+        };
+
+        let app = ParallelTuiApp::from_settings(&settings);
+        assert_eq!(app.state.layout_mode, LayoutMode::Focus);
+        assert_eq!(app.state.sort_order, SortOrder::Activity);
+        assert!(!app.should_quit);
     }
 }
