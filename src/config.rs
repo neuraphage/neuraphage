@@ -1,9 +1,11 @@
 //! Configuration for Neuraphage.
 
-use eyre::{Context, Result};
-use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use eyre::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::sandbox::SandboxMode;
 
@@ -25,6 +27,11 @@ pub struct Config {
     pub api: ApiSettings,
     /// Sandbox configuration.
     pub sandbox: SandboxSettings,
+    /// Budget and cost control settings.
+    pub budget: BudgetSettings,
+    /// Model pricing (override defaults).
+    #[serde(default = "default_model_pricing")]
+    pub model_pricing: ModelPricingMap,
 }
 
 impl Default for Config {
@@ -41,6 +48,8 @@ impl Default for Config {
             daemon: DaemonSettings::default(),
             api: ApiSettings::default(),
             sandbox: SandboxSettings::default(),
+            budget: BudgetSettings::default(),
+            model_pricing: default_model_pricing(),
         }
     }
 }
@@ -181,6 +190,87 @@ impl Default for SandboxSettings {
     }
 }
 
+/// Budget settings for cost control.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct BudgetSettings {
+    /// Maximum daily spend in USD (0 = unlimited).
+    pub daily: f64,
+    /// Maximum monthly spend in USD (0 = unlimited).
+    pub monthly: f64,
+    /// Maximum spend per task in USD.
+    pub per_task: f64,
+    /// Warning thresholds as fractions (e.g., [0.5, 0.75, 0.9]).
+    pub warn_at: Vec<f64>,
+    /// Action when budget exceeded: "pause" or "reject".
+    pub on_exceeded: BudgetAction,
+}
+
+impl Default for BudgetSettings {
+    fn default() -> Self {
+        Self {
+            daily: 0.0,     // Unlimited by default
+            monthly: 0.0,   // Unlimited by default
+            per_task: 10.0, // $10 per task default
+            warn_at: vec![0.5, 0.75, 0.9],
+            on_exceeded: BudgetAction::Pause,
+        }
+    }
+}
+
+/// Action to take when budget is exceeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BudgetAction {
+    /// Pause all tasks when budget exceeded.
+    #[default]
+    Pause,
+    /// Reject new tasks but allow running to complete.
+    Reject,
+}
+
+/// Model pricing configuration (cost per million tokens).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ModelPricing {
+    /// Cost per million input tokens in USD.
+    pub input: f64,
+    /// Cost per million output tokens in USD.
+    pub output: f64,
+}
+
+/// Map of model name patterns to pricing.
+pub type ModelPricingMap = HashMap<String, ModelPricing>;
+
+/// Default model pricing for Claude models.
+fn default_model_pricing() -> ModelPricingMap {
+    let mut m = HashMap::new();
+    // Claude 4 Sonnet
+    m.insert(
+        "sonnet".to_string(),
+        ModelPricing {
+            input: 3.0,
+            output: 15.0,
+        },
+    );
+    // Claude 4 Opus
+    m.insert(
+        "opus".to_string(),
+        ModelPricing {
+            input: 15.0,
+            output: 75.0,
+        },
+    );
+    // Claude 3 Haiku
+    m.insert(
+        "haiku".to_string(),
+        ModelPricing {
+            input: 0.25,
+            output: 1.25,
+        },
+    );
+    m
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,5 +364,71 @@ sandbox:
         assert!(config.sandbox.isolate_pids);
         assert_eq!(config.sandbox.extra_rw_paths, vec![PathBuf::from("/home/user/.cargo")]);
         assert_eq!(config.sandbox.extra_ro_paths, vec![PathBuf::from("/opt/tools")]);
+    }
+
+    #[test]
+    fn test_budget_settings_default() {
+        let settings = BudgetSettings::default();
+        assert!((settings.daily - 0.0).abs() < 0.001);
+        assert!((settings.monthly - 0.0).abs() < 0.001);
+        assert!((settings.per_task - 10.0).abs() < 0.001);
+        assert_eq!(settings.warn_at, vec![0.5, 0.75, 0.9]);
+        assert_eq!(settings.on_exceeded, BudgetAction::Pause);
+    }
+
+    #[test]
+    fn test_default_model_pricing() {
+        let pricing = default_model_pricing();
+        assert!(pricing.contains_key("sonnet"));
+        assert!(pricing.contains_key("opus"));
+        assert!(pricing.contains_key("haiku"));
+
+        let sonnet = &pricing["sonnet"];
+        assert!((sonnet.input - 3.0).abs() < 0.001);
+        assert!((sonnet.output - 15.0).abs() < 0.001);
+
+        let opus = &pricing["opus"];
+        assert!((opus.input - 15.0).abs() < 0.001);
+        assert!((opus.output - 75.0).abs() < 0.001);
+
+        let haiku = &pricing["haiku"];
+        assert!((haiku.input - 0.25).abs() < 0.001);
+        assert!((haiku.output - 1.25).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_config_with_budget() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("config.yml");
+
+        let config_content = r#"
+budget:
+  daily: 5.00
+  monthly: 50.00
+  per_task: 2.50
+  warn_at: [0.5, 0.9]
+  on_exceeded: reject
+model_pricing:
+  sonnet:
+    input: 3.5
+    output: 16.0
+  custom:
+    input: 10.0
+    output: 50.0
+"#;
+        fs::write(&config_path, config_content).unwrap();
+
+        let config = Config::load_from_file(&config_path).unwrap();
+        assert!((config.budget.daily - 5.0).abs() < 0.001);
+        assert!((config.budget.monthly - 50.0).abs() < 0.001);
+        assert!((config.budget.per_task - 2.5).abs() < 0.001);
+        assert_eq!(config.budget.warn_at, vec![0.5, 0.9]);
+        assert_eq!(config.budget.on_exceeded, BudgetAction::Reject);
+
+        // Model pricing should have custom values
+        assert!(config.model_pricing.contains_key("sonnet"));
+        assert!(config.model_pricing.contains_key("custom"));
+        let sonnet = &config.model_pricing["sonnet"];
+        assert!((sonnet.input - 3.5).abs() < 0.001);
     }
 }
