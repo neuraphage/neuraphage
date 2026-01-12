@@ -254,12 +254,28 @@ pub fn default_model_pricing() -> ModelPricingMap {
             output: 15.0,
         },
     );
-    // Claude 4 Opus
+    // Claude Opus 4.5 (claude-opus-4-5-20251101)
     m.insert(
-        "opus".to_string(),
+        "opus-4-5".to_string(),
+        ModelPricing {
+            input: 5.0,
+            output: 25.0,
+        },
+    );
+    // Claude 4 Opus (claude-opus-4-20250514) - legacy, more expensive
+    m.insert(
+        "opus-4".to_string(),
         ModelPricing {
             input: 15.0,
             output: 75.0,
+        },
+    );
+    // Fallback for "opus" - use 4.5 pricing as default
+    m.insert(
+        "opus".to_string(),
+        ModelPricing {
+            input: 5.0,
+            output: 25.0,
         },
     );
     // Claude 3 Haiku
@@ -383,15 +399,28 @@ sandbox:
         let pricing = default_model_pricing();
         assert!(pricing.contains_key("sonnet"));
         assert!(pricing.contains_key("opus"));
+        assert!(pricing.contains_key("opus-4"));
+        assert!(pricing.contains_key("opus-4-5"));
         assert!(pricing.contains_key("haiku"));
 
         let sonnet = &pricing["sonnet"];
         assert!((sonnet.input - 3.0).abs() < 0.001);
         assert!((sonnet.output - 15.0).abs() < 0.001);
 
+        // Generic "opus" defaults to 4.5 pricing
         let opus = &pricing["opus"];
-        assert!((opus.input - 15.0).abs() < 0.001);
-        assert!((opus.output - 75.0).abs() < 0.001);
+        assert!((opus.input - 5.0).abs() < 0.001);
+        assert!((opus.output - 25.0).abs() < 0.001);
+
+        // Opus 4.5 pricing
+        let opus_45 = &pricing["opus-4-5"];
+        assert!((opus_45.input - 5.0).abs() < 0.001);
+        assert!((opus_45.output - 25.0).abs() < 0.001);
+
+        // Opus 4 (legacy) pricing
+        let opus_4 = &pricing["opus-4"];
+        assert!((opus_4.input - 15.0).abs() < 0.001);
+        assert!((opus_4.output - 75.0).abs() < 0.001);
 
         let haiku = &pricing["haiku"];
         assert!((haiku.input - 0.25).abs() < 0.001);

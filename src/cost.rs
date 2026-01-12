@@ -187,11 +187,16 @@ impl CostTracker {
     /// Calculate cost for a model and token usage.
     pub fn calculate_cost(&self, model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
         // Find pricing by matching model name (case-insensitive contains)
-        let pricing = self
+        // Sort by pattern length descending to match most specific first
+        // e.g., "opus-4-5" should match before "opus-4" or "opus"
+        let model_lower = model.to_lowercase();
+        let mut matches: Vec<_> = self
             .pricing
             .iter()
-            .find(|(pattern, _)| model.to_lowercase().contains(&pattern.to_lowercase()))
-            .map(|(_, p)| p);
+            .filter(|(pattern, _)| model_lower.contains(&pattern.to_lowercase()))
+            .collect();
+        matches.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        let pricing = matches.first().map(|(_, p)| *p);
 
         match pricing {
             Some(p) => {
@@ -435,11 +440,28 @@ mod tests {
                 output: 15.0,
             },
         );
+        // Opus 4.5 (more specific, should match first)
         m.insert(
-            "opus".to_string(),
+            "opus-4-5".to_string(),
+            crate::config::ModelPricing {
+                input: 5.0,
+                output: 25.0,
+            },
+        );
+        // Opus 4 (legacy)
+        m.insert(
+            "opus-4".to_string(),
             crate::config::ModelPricing {
                 input: 15.0,
                 output: 75.0,
+            },
+        );
+        // Generic opus fallback (uses 4.5 pricing)
+        m.insert(
+            "opus".to_string(),
+            crate::config::ModelPricing {
+                input: 5.0,
+                output: 25.0,
             },
         );
         m
@@ -460,13 +482,27 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_cost_opus() {
+    fn test_calculate_cost_opus_4() {
         let temp = TempDir::new().unwrap();
         let tracker = CostTracker::new(make_settings(), make_pricing(), temp.path()).unwrap();
 
-        // 1M input + 1M output for opus = $15 + $75 = $90
+        // Opus 4: 1M input + 1M output = $15 + $75 = $90
         let cost = tracker.calculate_cost("claude-opus-4-20250514", 1_000_000, 1_000_000);
         assert!((cost - 90.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_calculate_cost_opus_4_5() {
+        let temp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(make_settings(), make_pricing(), temp.path()).unwrap();
+
+        // Opus 4.5: 1M input + 1M output = $5 + $25 = $30
+        let cost = tracker.calculate_cost("claude-opus-4-5-20251101", 1_000_000, 1_000_000);
+        assert!((cost - 30.0).abs() < 0.001);
+
+        // Generic "opus" should use 4.5 pricing (current default)
+        let cost = tracker.calculate_cost("opus", 1_000_000, 1_000_000);
+        assert!((cost - 30.0).abs() < 0.001);
     }
 
     #[test]
