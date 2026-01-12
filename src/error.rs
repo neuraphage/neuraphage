@@ -54,6 +54,25 @@ pub enum Error {
     /// Network error
     #[error("network error: {0}")]
     Network(String),
+
+    /// Path is not inside a git repository
+    #[error("path is not inside a git repository: {path}")]
+    NotGitRepo { path: std::path::PathBuf },
+
+    /// Worktree already exists for task
+    #[error("worktree already exists for task {task_id}: {path}")]
+    WorktreeExists {
+        task_id: crate::TaskId,
+        path: std::path::PathBuf,
+    },
+
+    /// Worktree not found for task
+    #[error("worktree not found for task {task_id}")]
+    WorktreeNotFound { task_id: crate::TaskId },
+
+    /// Git command failed
+    #[error("git command '{command}' failed: {stderr}")]
+    Git { command: String, stderr: String },
 }
 
 impl From<eyre::Report> for Error {

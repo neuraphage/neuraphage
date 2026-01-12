@@ -9,6 +9,7 @@ pub mod coordination;
 pub mod daemon;
 pub mod error;
 pub mod executor;
+pub mod git;
 pub mod personas;
 pub mod repl;
 pub mod safety;
@@ -53,3 +54,6 @@ pub use safety::{SafetyCheckResult, SafetyChecker, SafetyConfig};
 
 // Re-export sandbox types
 pub use sandbox::{SandboxAvailability, SandboxConfig, SandboxMode};
+
+// Re-export git types
+pub use git::{GitCoordinator, ReconcileResult, WorktreeInfo, WorktreeRegistry};

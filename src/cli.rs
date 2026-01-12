@@ -22,6 +22,17 @@ fn generate_after_help() -> String {
     };
     lines.push(bwrap_status);
 
+    // Check git
+    let git_status = match std::process::Command::new("git").arg("--version").output() {
+        Ok(output) if output.status.success() => {
+            let version = String::from_utf8_lossy(&output.stdout);
+            let version = version.trim().replace("git version ", "");
+            format!("  ✅ git        {}", version)
+        }
+        _ => "  ❌ git        not installed".to_string(),
+    };
+    lines.push(git_status);
+
     lines.push(String::new());
 
     // Daemon section (bold)
