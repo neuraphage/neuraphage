@@ -19,6 +19,7 @@ use tokio::task::JoinHandle;
 use crate::agentic::{AgenticConfig, AgenticLoop, AnthropicClient, IterationResult, LlmClient};
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::recovery::{ExecutionStateStore, PersistedExecutionState};
 use crate::task::{Task, TaskId};
 
 /// Configuration for the task executor.
@@ -278,6 +279,8 @@ pub struct TaskExecutor {
     llm: Arc<dyn LlmClient + Send + Sync>,
     running_tasks: HashMap<TaskId, RunningTask>,
     git: crate::git::GitCoordinator,
+    /// Execution state store for crash recovery.
+    state_store: ExecutionStateStore,
 }
 
 impl TaskExecutor {
@@ -291,11 +294,15 @@ impl TaskExecutor {
             .clone()
             .unwrap_or_else(|| config.data_dir.parent().unwrap_or(&config.data_dir).join(".worktrees"));
 
+        // Initialize execution state store for crash recovery
+        let state_store = ExecutionStateStore::new(config.data_dir.join("execution_state"));
+
         Ok(Self {
             config,
             llm,
             running_tasks: HashMap::new(),
             git: crate::git::GitCoordinator::new(worktree_base),
+            state_store,
         })
     }
 
@@ -306,11 +313,14 @@ impl TaskExecutor {
             .clone()
             .unwrap_or_else(|| config.data_dir.parent().unwrap_or(&config.data_dir).join(".worktrees"));
 
+        let state_store = ExecutionStateStore::new(config.data_dir.join("execution_state"));
+
         Self {
             config,
             llm,
             running_tasks: HashMap::new(),
             git: crate::git::GitCoordinator::new(worktree_base),
+            state_store,
         }
     }
 
@@ -522,6 +532,68 @@ impl TaskExecutor {
     /// Get mutable access to the GitCoordinator.
     pub fn git_mut(&mut self) -> &mut crate::git::GitCoordinator {
         &mut self.git
+    }
+
+    /// Get the execution state store.
+    pub fn state_store(&self) -> &ExecutionStateStore {
+        &self.state_store
+    }
+
+    /// Save execution state for a task (for crash recovery).
+    pub async fn save_execution_state(
+        &self,
+        task_id: &TaskId,
+        working_dir: &std::path::Path,
+        worktree_path: Option<&std::path::Path>,
+        reason: &str,
+    ) -> Result<()> {
+        let state = PersistedExecutionState {
+            task_id: task_id.0.clone(),
+            iteration: 0,
+            tokens_used: 0,
+            cost: 0.0,
+            phase: "initialization".to_string(),
+            working_dir: working_dir.to_path_buf(),
+            worktree_path: worktree_path.map(|p| p.to_path_buf()),
+            checkpoint_at: Utc::now(),
+            started_reason: reason.to_string(),
+        };
+        self.state_store.save(&task_id.0, &state).await
+    }
+
+    /// Update execution state checkpoint from current running state.
+    pub async fn checkpoint_task(&self, task_id: &TaskId) -> Result<()> {
+        let running = self
+            .running_tasks
+            .get(task_id)
+            .ok_or_else(|| Error::TaskNotFound { id: task_id.0.clone() })?;
+
+        let (iteration, tokens_used, cost) = match &running.state.status {
+            ExecutionStatus::Running {
+                iteration,
+                tokens_used,
+                cost,
+            } => (*iteration, *tokens_used, *cost),
+            _ => (0, 0, 0.0),
+        };
+
+        let state = PersistedExecutionState {
+            task_id: task_id.0.clone(),
+            iteration,
+            tokens_used,
+            cost,
+            phase: "running".to_string(),
+            working_dir: running.worktree_path.clone().unwrap_or_else(|| PathBuf::from(".")),
+            worktree_path: running.worktree_path.clone(),
+            checkpoint_at: Utc::now(),
+            started_reason: "checkpoint".to_string(),
+        };
+        self.state_store.save(&task_id.0, &state).await
+    }
+
+    /// Remove execution state for a completed/failed task.
+    pub async fn remove_execution_state(&self, task_id: &TaskId) -> Result<()> {
+        self.state_store.remove(&task_id.0).await
     }
 
     /// Get the worktree path for a running task, if one was created.

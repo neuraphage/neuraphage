@@ -69,3 +69,7 @@ pub use git::{
 pub use supervised::{
     HeartbeatFreshness, SupervisedExecutor, SupervisedExecutorConfig, SupervisionHealth, TaskHeartbeat,
 };
+
+// Re-export recovery types
+pub mod recovery;
+pub use recovery::{ExecutionStateStore, PersistedExecutionState};
