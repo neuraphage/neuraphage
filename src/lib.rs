@@ -11,6 +11,7 @@ pub mod daemon;
 pub mod error;
 pub mod executor;
 pub mod git;
+pub mod notifications;
 pub mod personas;
 pub mod repl;
 pub mod safety;
@@ -18,7 +19,7 @@ pub mod sandbox;
 pub mod supervised;
 pub mod task;
 pub mod tasks;
-pub mod ui;
+pub mod tui;
 
 pub use config::Config;
 pub use daemon::{Daemon, DaemonConfig};
@@ -37,8 +38,9 @@ pub use coordination::{Knowledge, KnowledgeKind, KnowledgeStore};
 pub use coordination::{Lock, LockManager, ResourceId};
 pub use coordination::{ScheduleResult, Scheduler, SchedulerConfig};
 
-// Re-export UI types
-pub use ui::{App, AppState, Notification, NotificationKind, Notifier, Tui};
+// Re-export TUI types
+pub use notifications::{Notification, NotificationKind, Notifier};
+pub use tui::{App, AppState, Tui};
 
 // Re-export personas types
 pub use personas::{ModelTier, Persona, PersonaStore};

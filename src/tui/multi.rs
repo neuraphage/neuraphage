@@ -24,8 +24,8 @@ use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, 
 
 use crate::config::{TuiLayoutMode, TuiSettings, TuiSortOrder};
 use crate::error::Result;
+use crate::notifications::Notification;
 use crate::task::{TaskId, TaskStatus};
-use crate::ui::notifications::Notification;
 
 /// Maximum lines to keep in output buffer per workstream.
 const MAX_OUTPUT_LINES: usize = 1000;

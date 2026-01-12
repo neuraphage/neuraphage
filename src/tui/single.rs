@@ -18,8 +18,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Sparkline, Wrap};
 
 use crate::error::Result;
+use crate::notifications::Notification;
 use crate::task::{Task, TaskStatus};
-use crate::ui::notifications::Notification;
 
 /// Application state for the TUI.
 #[derive(Debug, Clone)]
