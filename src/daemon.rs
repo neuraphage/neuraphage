@@ -10,8 +10,36 @@ use tokio::sync::Mutex;
 
 use crate::error::{Error, Result};
 use crate::executor::{Activity, ExecutionEvent, ExecutionStatus, ExecutorConfig, TaskExecutor};
+use crate::git::{MergeQueue, MergeRequest, WorktreeInfo};
 use crate::task::{Task, TaskId, TaskStatus};
 use crate::task_manager::TaskManager;
+
+/// DTO for worktree info (serializable version of WorktreeInfo).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeInfoDto {
+    /// Task ID this worktree belongs to.
+    pub task_id: String,
+    /// Path to the worktree.
+    pub path: String,
+    /// Branch name.
+    pub branch: String,
+    /// Path to the main repository.
+    pub repo_path: String,
+    /// When the worktree was created.
+    pub created_at: String,
+}
+
+impl From<&WorktreeInfo> for WorktreeInfoDto {
+    fn from(info: &WorktreeInfo) -> Self {
+        Self {
+            task_id: info.task_id.0.clone(),
+            path: info.path.to_string_lossy().to_string(),
+            branch: info.branch.clone(),
+            repo_path: info.repo_path.to_string_lossy().to_string(),
+            created_at: info.created_at.to_rfc3339(),
+        }
+    }
+}
 
 /// Daemon configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +90,14 @@ pub enum DaemonRequest {
         context: Option<String>,
         working_dir: Option<String>,
     },
+    /// Create a new task with automatic worktree setup.
+    CreateTaskWithWorktree {
+        description: String,
+        priority: u8,
+        tags: Vec<String>,
+        context: Option<String>,
+        repo_path: String,
+    },
     /// Get a task by ID.
     GetTask { id: String },
     /// List tasks, optionally filtered.
@@ -94,6 +130,14 @@ pub enum DaemonRequest {
     GetExecutionStatus { id: String },
     /// Cancel a running task.
     CancelTask { id: String },
+    /// Get worktree info for a task.
+    GetWorktreeInfo { id: String },
+    /// List all active worktrees.
+    ListWorktrees,
+    /// Get merge queue status.
+    MergeQueueStatus,
+    /// Enqueue a task for merging.
+    EnqueueMerge { id: String, target_branch: Option<String> },
     /// Shutdown daemon.
     Shutdown,
 }
@@ -138,6 +182,14 @@ pub enum DaemonResponse {
     },
     /// Task started executing.
     TaskStarted { task_id: String },
+    /// Worktree info response.
+    WorktreeInfo(Option<WorktreeInfoDto>),
+    /// List of active worktrees.
+    Worktrees(Vec<WorktreeInfoDto>),
+    /// Merge queue status response.
+    MergeQueueStatusResponse { pending: usize, active: Option<String> },
+    /// Task enqueued for merge.
+    MergeEnqueued { task_id: String },
     /// Shutdown acknowledgment.
     Shutdown,
 }
@@ -271,6 +323,7 @@ pub struct Daemon {
     config: DaemonConfig,
     manager: Arc<Mutex<TaskManager>>,
     executor: Arc<Mutex<TaskExecutor>>,
+    merge_queue: Arc<Mutex<MergeQueue>>,
     shutdown: tokio::sync::broadcast::Sender<()>,
 }
 
@@ -294,12 +347,16 @@ impl Daemon {
         };
         let executor = TaskExecutor::new(executor_config)?;
 
+        // Initialize merge queue
+        let merge_queue = MergeQueue::new();
+
         let (shutdown, _) = tokio::sync::broadcast::channel(1);
 
         Ok(Self {
             config,
             manager: Arc::new(Mutex::new(manager)),
             executor: Arc::new(Mutex::new(executor)),
+            merge_queue: Arc::new(Mutex::new(merge_queue)),
             shutdown,
         })
     }
@@ -327,9 +384,10 @@ impl Daemon {
                         Ok((stream, _)) => {
                             let manager = Arc::clone(&self.manager);
                             let executor = Arc::clone(&self.executor);
+                            let merge_queue = Arc::clone(&self.merge_queue);
                             let shutdown_tx = self.shutdown.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection(stream, manager, executor, shutdown_tx).await {
+                                if let Err(e) = handle_connection(stream, manager, executor, merge_queue, shutdown_tx).await {
                                     log::error!("Connection error: {}", e);
                                 }
                             });
@@ -368,6 +426,7 @@ async fn handle_connection(
     stream: UnixStream,
     manager: Arc<Mutex<TaskManager>>,
     executor: Arc<Mutex<TaskExecutor>>,
+    merge_queue: Arc<Mutex<MergeQueue>>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
@@ -376,7 +435,7 @@ async fn handle_connection(
 
     while reader.read_line(&mut line).await? > 0 {
         let request: DaemonRequest = serde_json::from_str(&line)?;
-        let response = process_request(request, &manager, &executor, &shutdown_tx).await;
+        let response = process_request(request, &manager, &executor, &merge_queue, &shutdown_tx).await;
 
         let response_json = serde_json::to_string(&response)?;
         writer.write_all(response_json.as_bytes()).await?;
@@ -398,6 +457,7 @@ async fn process_request(
     request: DaemonRequest,
     manager: &Arc<Mutex<TaskManager>>,
     executor: &Arc<Mutex<TaskExecutor>>,
+    merge_queue: &Arc<Mutex<MergeQueue>>,
     shutdown_tx: &tokio::sync::broadcast::Sender<()>,
 ) -> DaemonResponse {
     match request {
@@ -631,6 +691,87 @@ async fn process_request(
                 }
                 Err(e) => DaemonResponse::Error { message: e.to_string() },
             }
+        }
+
+        DaemonRequest::CreateTaskWithWorktree {
+            description,
+            priority,
+            tags,
+            context,
+            repo_path,
+        } => {
+            // Create the task first
+            let tags_refs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
+            let mut mgr = manager.lock().await;
+            let task = match mgr.create_task(&description, priority, &tags_refs, context.as_deref()) {
+                Ok(task) => task,
+                Err(e) => {
+                    return DaemonResponse::Error { message: e.to_string() };
+                }
+            };
+            drop(mgr);
+
+            // Start the task with worktree setup
+            let repo = PathBuf::from(repo_path);
+            let mut exec = executor.lock().await;
+            match exec.start_task_with_worktree(task.clone(), Some(repo)).await {
+                Ok(()) => {
+                    // Update task status to Running
+                    let mut mgr = manager.lock().await;
+                    let _ = mgr.set_status(&task.id, TaskStatus::Running);
+                    DaemonResponse::Task(Some(task))
+                }
+                Err(e) => DaemonResponse::Error { message: e.to_string() },
+            }
+        }
+
+        DaemonRequest::GetWorktreeInfo { id } => {
+            let task_id = TaskId::from_engram_id(&id);
+            let exec = executor.lock().await;
+            match exec.get_worktree(&task_id) {
+                Some(info) => DaemonResponse::WorktreeInfo(Some(info.into())),
+                None => DaemonResponse::WorktreeInfo(None),
+            }
+        }
+
+        DaemonRequest::ListWorktrees => {
+            let exec = executor.lock().await;
+            let worktrees: Vec<WorktreeInfoDto> = exec.git().list_worktrees().iter().map(|w| (*w).into()).collect();
+            DaemonResponse::Worktrees(worktrees)
+        }
+
+        DaemonRequest::MergeQueueStatus => {
+            let queue = merge_queue.lock().await;
+            DaemonResponse::MergeQueueStatusResponse {
+                pending: queue.len(),
+                active: queue.active().map(|r| r.task_id.0.clone()),
+            }
+        }
+
+        DaemonRequest::EnqueueMerge { id, target_branch } => {
+            let task_id = TaskId::from_engram_id(&id);
+            let exec = executor.lock().await;
+
+            // Get worktree info to determine branch and repo
+            let Some(worktree) = exec.get_worktree(&task_id) else {
+                return DaemonResponse::Error {
+                    message: format!("No worktree found for task {}", id),
+                };
+            };
+
+            let request = MergeRequest {
+                task_id: task_id.clone(),
+                branch: worktree.branch.clone(),
+                target: target_branch.unwrap_or_else(|| "main".to_string()),
+                repo_path: worktree.repo_path.clone(),
+                completed_at: chrono::Utc::now(),
+            };
+            drop(exec);
+
+            let mut queue = merge_queue.lock().await;
+            queue.enqueue(request);
+
+            DaemonResponse::MergeEnqueued { task_id: id }
         }
 
         DaemonRequest::Shutdown => {
