@@ -24,7 +24,7 @@ use crate::executor::ExecutionEvent;
 use crate::task::Task;
 
 pub use anthropic::AnthropicClient;
-pub use conversation::{Conversation, Message, MessageRole};
+pub use conversation::{CheckpointMarker, Conversation, ConversationExecutionState, Message, MessageRole};
 pub use llm::{LlmClient, LlmConfig, LlmResponse, StreamChunk};
 pub use prompt::{PromptContext, SystemPrompt};
 pub use tools::{Tool, ToolCall, ToolExecutor, ToolResult};
