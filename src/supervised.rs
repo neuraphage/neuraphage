@@ -1008,6 +1008,87 @@ impl SupervisedExecutor {
         Ok(result)
     }
 
+    /// Get rebase status for all tasks with worktrees.
+    pub async fn get_all_rebase_status(&self) -> Vec<crate::git::TaskRebaseStatus> {
+        let git = match &self.git_coordinator {
+            Some(g) => g,
+            None => return Vec::new(),
+        };
+
+        let worktrees: Vec<crate::git::WorktreeInfo> = {
+            let git_lock = git.lock().await;
+            let refs = git_lock.list_worktrees();
+            refs.into_iter().cloned().collect()
+        };
+
+        let mut statuses = Vec::new();
+        let main_watcher = self.main_watcher.lock().await;
+
+        for worktree in worktrees {
+            if let Ok(status) = main_watcher.get_rebase_status(&worktree.task_id, &worktree).await {
+                statuses.push(status);
+            }
+        }
+
+        statuses
+    }
+
+    /// Handle a rebase conflict by notifying the task.
+    ///
+    /// This is called when a rebase fails due to conflicts. It:
+    /// 1. Publishes a RebaseConflict event
+    /// 2. Injects a message into the task explaining the conflict
+    /// 3. Optionally escalates to MergeCop if configured
+    pub async fn handle_rebase_conflict(
+        &self,
+        task_id: &TaskId,
+        details: &str,
+        conflicting_files: &[std::path::PathBuf],
+    ) -> Result<()> {
+        // Publish conflict event
+        self.event_bus
+            .publish(
+                Event::new(EventKind::RebaseConflict)
+                    .from_task(task_id.clone())
+                    .with_payload(serde_json::json!({
+                        "details": details,
+                        "conflicting_files": conflicting_files,
+                    })),
+            )
+            .await;
+
+        // Inject a message to the task explaining the conflict
+        let conflict_msg = format!(
+            "<rebase-conflict>\n\
+             Rebase against main failed due to conflicts in {} file(s):\n{}\n\n\
+             The rebase has been aborted. You can:\n\
+             1. Continue working and resolve conflicts later at merge time\n\
+             2. Manually rebase using: git fetch origin main && git rebase origin/main\n\
+             3. Wait for the next main update and try again\n\
+             </rebase-conflict>",
+            conflicting_files.len(),
+            conflicting_files
+                .iter()
+                .take(10)
+                .map(|f| format!("  - {}", f.display()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+
+        let executor = self.executor.lock().await;
+        executor
+            .inject_message(
+                task_id,
+                InjectedMessage::Nudge {
+                    message: conflict_msg,
+                    severity: NudgeSeverity::Warning,
+                },
+            )
+            .await?;
+
+        Ok(())
+    }
+
     /// Run a full syncer cycle.
     async fn run_syncer_cycle(&self) -> Result<()> {
         // Get all running task IDs
