@@ -4,6 +4,8 @@
 //! the event loop for input, rendering, and state updates.
 
 use std::io::{self, Stdout};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
@@ -13,7 +15,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::config::Config;
-use crate::daemon::{DaemonClient, DaemonRequest, DaemonResponse, ExecutionEventDto, ExecutionStatusDto};
+use crate::daemon::{DaemonClient, DaemonConfig, DaemonRequest, DaemonResponse, ExecutionEventDto, ExecutionStatusDto};
 use crate::error::{Error, Result};
 use crate::task::{Task, TaskStatus};
 use crate::tui::multi::{
@@ -29,10 +31,21 @@ const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Interval for refreshing full task list.
 const TASK_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Maximum reconnection backoff.
+const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Minimum terminal width.
+const MIN_TERMINAL_WIDTH: u16 = 40;
+
+/// Minimum terminal height.
+const MIN_TERMINAL_HEIGHT: u16 = 10;
+
 /// TUI runner that manages the event loop and daemon connection.
 pub struct TuiRunner {
     /// Daemon client for communication.
-    client: DaemonClient,
+    client: Option<DaemonClient>,
+    /// Daemon configuration for reconnection.
+    daemon_config: DaemonConfig,
     /// TUI application state.
     app: ParallelTuiApp,
     /// Terminal for rendering.
@@ -41,11 +54,16 @@ pub struct TuiRunner {
     last_event_poll: Instant,
     /// Last time we refreshed the task list.
     last_task_refresh: Instant,
+    /// Last time we attempted to reconnect.
+    last_reconnect_attempt: Option<Instant>,
     /// Whether the runner should exit.
     should_exit: bool,
     /// Reconnection backoff (exponential).
-    #[allow(dead_code)]
     reconnect_backoff: Duration,
+    /// Number of reconnect attempts.
+    reconnect_attempts: u8,
+    /// Signal flag for clean shutdown (SIGHUP/SIGTERM).
+    shutdown_signal: Arc<AtomicBool>,
 }
 
 impl TuiRunner {
@@ -54,6 +72,9 @@ impl TuiRunner {
         // Initialize TUI app from config
         let app = ParallelTuiApp::from_settings(&config.tui);
 
+        // Get daemon config for reconnection (use default paths)
+        let daemon_config = DaemonConfig::default();
+
         // Set up terminal
         enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -61,14 +82,33 @@ impl TuiRunner {
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
 
+        // Set up signal handler for clean shutdown
+        let shutdown_signal = Arc::new(AtomicBool::new(false));
+        let signal_clone = shutdown_signal.clone();
+
+        // Handle SIGHUP (SSH disconnect) and SIGTERM
+        #[cfg(unix)]
+        {
+            let _ = ctrlc::set_handler(move || {
+                signal_clone.store(true, Ordering::SeqCst);
+            });
+        }
+
+        // Suppress unused warning for non-unix platforms
+        let _ = &config.daemon;
+
         Ok(Self {
-            client,
+            client: Some(client),
+            daemon_config,
             app,
             terminal,
             last_event_poll: Instant::now(),
             last_task_refresh: Instant::now(),
+            last_reconnect_attempt: None,
             should_exit: false,
             reconnect_backoff: Duration::from_secs(1),
+            reconnect_attempts: 0,
+            shutdown_signal,
         })
     }
 
@@ -90,17 +130,31 @@ impl TuiRunner {
         // Main event loop
         let mut last_frame = Instant::now();
         loop {
+            // Check for shutdown signal (SIGHUP/SIGTERM)
+            if self.shutdown_signal.load(Ordering::SeqCst) {
+                self.should_exit = true;
+            }
+
             // Handle terminal input (non-blocking)
             if event::poll(Duration::from_millis(1))? {
                 let evt = event::read()?;
-                if let Event::Key(key) = evt {
-                    // Handle Ctrl+C globally
-                    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                        self.initiate_quit();
-                    } else {
-                        // Delegate to app's event handler
-                        self.app.handle_event(Event::Key(key));
+                match evt {
+                    Event::Key(key) => {
+                        // Handle Ctrl+C globally
+                        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                            self.initiate_quit();
+                        } else {
+                            // Delegate to app's event handler
+                            self.app.handle_event(Event::Key(key));
+                        }
                     }
+                    Event::Resize(width, height) => {
+                        // Check minimum terminal size
+                        if width < MIN_TERMINAL_WIDTH || height < MIN_TERMINAL_HEIGHT {
+                            // Terminal too small - will show warning in render
+                        }
+                    }
+                    _ => {}
                 }
             }
 
@@ -109,16 +163,24 @@ impl TuiRunner {
                 break;
             }
 
-            // Poll daemon for events periodically
-            if self.last_event_poll.elapsed() >= EVENT_POLL_INTERVAL {
-                self.poll_daemon_events().await;
-                self.last_event_poll = Instant::now();
+            // If disconnected, attempt reconnection
+            if self.client.is_none() {
+                self.try_reconnect().await;
             }
 
-            // Refresh full task list periodically
-            if self.last_task_refresh.elapsed() >= TASK_REFRESH_INTERVAL {
-                self.refresh_tasks().await;
-                self.last_task_refresh = Instant::now();
+            // Only poll if connected
+            if self.client.is_some() {
+                // Poll daemon for events periodically
+                if self.last_event_poll.elapsed() >= EVENT_POLL_INTERVAL {
+                    self.poll_daemon_events().await;
+                    self.last_event_poll = Instant::now();
+                }
+
+                // Refresh full task list periodically
+                if self.last_task_refresh.elapsed() >= TASK_REFRESH_INTERVAL {
+                    self.refresh_tasks().await;
+                    self.last_task_refresh = Instant::now();
+                }
             }
 
             // Render at frame interval
@@ -135,10 +197,52 @@ impl TuiRunner {
         Ok(())
     }
 
+    /// Attempt to reconnect to the daemon with exponential backoff.
+    async fn try_reconnect(&mut self) {
+        // Check if enough time has passed since last attempt
+        if let Some(last_attempt) = self.last_reconnect_attempt
+            && last_attempt.elapsed() < self.reconnect_backoff
+        {
+            return;
+        }
+
+        self.reconnect_attempts = self.reconnect_attempts.saturating_add(1);
+        self.last_reconnect_attempt = Some(Instant::now());
+        self.app.state.connection_status = ConnectionStatus::Reconnecting(self.reconnect_attempts);
+
+        // Attempt to connect
+        match DaemonClient::connect(&self.daemon_config).await {
+            Ok(client) => {
+                self.client = Some(client);
+                self.app.state.connection_status = ConnectionStatus::Connected;
+                self.reconnect_backoff = Duration::from_secs(1); // Reset backoff
+                self.reconnect_attempts = 0;
+
+                // Refresh data after reconnect
+                self.refresh_tasks().await;
+                self.refresh_statuses().await;
+                self.refresh_budget().await;
+            }
+            Err(_) => {
+                self.app.state.connection_status = ConnectionStatus::Disconnected;
+                // Exponential backoff, capped at MAX_RECONNECT_BACKOFF
+                self.reconnect_backoff = (self.reconnect_backoff * 2).min(MAX_RECONNECT_BACKOFF);
+            }
+        }
+    }
+
     /// Fetch initial data from daemon (tasks, status, budget).
     async fn fetch_initial_data(&mut self) -> Result<()> {
+        let client = match self.client.as_mut() {
+            Some(c) => c,
+            None => {
+                self.app.state.connection_status = ConnectionStatus::Disconnected;
+                return Err(Error::Daemon("Not connected to daemon".into()));
+            }
+        };
+
         // Ping to verify connection
-        match self.client.request(DaemonRequest::Ping).await {
+        match client.request(DaemonRequest::Ping).await {
             Ok(DaemonResponse::Pong) => {
                 self.app.state.connection_status = ConnectionStatus::Connected;
             }
@@ -165,15 +269,21 @@ impl TuiRunner {
 
     /// Refresh the task list from daemon.
     async fn refresh_tasks(&mut self) {
+        let client = match self.client.as_mut() {
+            Some(c) => c,
+            None => return,
+        };
+
         let request = DaemonRequest::ListTasks { status: None };
-        match self.client.request(request).await {
+        match client.request(request).await {
             Ok(DaemonResponse::Tasks(tasks)) => {
                 self.app.state.connection_status = ConnectionStatus::Connected;
                 self.reconnect_backoff = Duration::from_secs(1);
+                self.reconnect_attempts = 0;
                 self.sync_workstreams(&tasks);
             }
             Ok(DaemonResponse::Error { .. }) => {
-                // Ignore errors for now - will handle in Phase 5
+                // Log errors but don't disconnect
             }
             Err(_) => {
                 self.handle_disconnect();
@@ -184,15 +294,20 @@ impl TuiRunner {
 
     /// Refresh execution statuses for all tasks.
     async fn refresh_statuses(&mut self) {
+        let client = match self.client.as_mut() {
+            Some(c) => c,
+            None => return,
+        };
+
         let request = DaemonRequest::GetAllExecutionStatus;
-        match self.client.request(request).await {
+        match client.request(request).await {
             Ok(DaemonResponse::AllExecutionStatus { statuses }) => {
                 for (task_id, status) in statuses {
                     self.apply_status_to_workstream(&task_id, &status);
                 }
             }
             Ok(DaemonResponse::Error { .. }) => {
-                // Ignore errors for now
+                // Log errors but don't disconnect
             }
             Err(_) => {
                 self.handle_disconnect();
@@ -203,8 +318,13 @@ impl TuiRunner {
 
     /// Refresh budget status.
     async fn refresh_budget(&mut self) {
+        let client = match self.client.as_mut() {
+            Some(c) => c,
+            None => return,
+        };
+
         let request = DaemonRequest::GetBudgetStatus;
-        match self.client.request(request).await {
+        match client.request(request).await {
             Ok(DaemonResponse::BudgetStatusResponse {
                 daily_used,
                 daily_limit,
@@ -217,7 +337,7 @@ impl TuiRunner {
                 self.app.state.budget = BudgetStatus::new(current, limit);
             }
             Ok(DaemonResponse::Error { .. }) => {
-                // Ignore errors for now
+                // Log errors but don't disconnect
             }
             Err(_) => {
                 // Don't disconnect just for budget errors
@@ -228,8 +348,13 @@ impl TuiRunner {
 
     /// Poll daemon for new events.
     async fn poll_daemon_events(&mut self) {
+        let client = match self.client.as_mut() {
+            Some(c) => c,
+            None => return,
+        };
+
         let request = DaemonRequest::SubscribeAllTasks;
-        match self.client.request(request).await {
+        match client.request(request).await {
             Ok(DaemonResponse::AllExecutionEvents { events }) => {
                 self.app.state.connection_status = ConnectionStatus::Connected;
                 for (task_id, event) in events {
@@ -237,7 +362,7 @@ impl TuiRunner {
                 }
             }
             Ok(DaemonResponse::Error { .. }) => {
-                // Ignore errors for now
+                // Log errors but don't disconnect
             }
             Err(_) => {
                 self.handle_disconnect();
@@ -336,8 +461,9 @@ impl TuiRunner {
 
     /// Handle disconnect from daemon.
     fn handle_disconnect(&mut self) {
+        self.client = None;
         self.app.state.connection_status = ConnectionStatus::Disconnected;
-        // TODO: In Phase 5, implement reconnection with exponential backoff
+        // Reconnection will be attempted in the main loop via try_reconnect()
     }
 
     /// Initiate quit (may show confirmation dialog).
