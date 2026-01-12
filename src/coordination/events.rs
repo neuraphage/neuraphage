@@ -49,6 +49,16 @@ pub enum EventKind {
     /// Supervision recovered from degraded mode.
     SupervisionRecovered,
 
+    // Proactive rebase events
+    /// Main branch received new commits.
+    MainUpdated,
+    /// A task needs to rebase against main.
+    RebaseRequired,
+    /// A task completed rebasing successfully.
+    RebaseCompleted,
+    /// A rebase encountered conflicts and was aborted.
+    RebaseConflict,
+
     /// Custom event type.
     Custom(String),
 }

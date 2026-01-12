@@ -159,6 +159,15 @@ pub enum InjectedMessage {
         /// Reason for pausing.
         reason: String,
     },
+    /// Rebase notification - main branch has new commits.
+    Rebase {
+        /// Number of commits behind main.
+        commits_behind: usize,
+        /// Summaries of new commits on main (most recent first).
+        new_commits: Vec<String>,
+        /// How urgent this rebase is.
+        urgency: SyncUrgency,
+    },
 }
 
 impl InjectedMessage {
@@ -180,6 +189,31 @@ impl InjectedMessage {
             }
             InjectedMessage::Pause { reason } => {
                 format!("<system-pause>{}</system-pause>", reason)
+            }
+            InjectedMessage::Rebase {
+                commits_behind,
+                new_commits,
+                urgency,
+            } => {
+                let commit_list = if new_commits.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "\nRecent commits on main:\n{}",
+                        new_commits
+                            .iter()
+                            .map(|c| format!("  - {}", c))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    )
+                };
+                format!(
+                    "<rebase-notification urgency=\"{:?}\" commits_behind=\"{}\">\n\
+                     Main branch has {} new commit(s) since your branch diverged. \
+                     Consider rebasing to incorporate these changes and prevent merge conflicts later.{}\n\
+                     </rebase-notification>",
+                    urgency, commits_behind, commits_behind, commit_list
+                )
             }
         }
     }
@@ -913,6 +947,22 @@ async fn execute_task(
                         cost: agentic_loop.cost(),
                     };
                 }
+                InjectedMessage::Rebase {
+                    commits_behind,
+                    new_commits,
+                    urgency,
+                } => {
+                    // Inject rebase notification as system message
+                    let rebase_msg = InjectedMessage::Rebase {
+                        commits_behind,
+                        new_commits,
+                        urgency,
+                    };
+                    let rebase_content = rebase_msg.format_for_injection();
+                    if let Err(e) = agentic_loop.inject_system_message(&rebase_content) {
+                        log::warn!("Failed to inject rebase notification: {}", e);
+                    }
+                }
             }
         }
 
@@ -1367,5 +1417,44 @@ mod tests {
         // Third poll with no new events
         let events: Vec<_> = buffer.iter().skip(last_poll_idx).cloned().collect();
         assert_eq!(events.len(), 0);
+    }
+
+    #[test]
+    fn test_injected_message_rebase_format() {
+        let msg = InjectedMessage::Rebase {
+            commits_behind: 3,
+            new_commits: vec![
+                "abc123: feat: add new API".to_string(),
+                "def456: fix: resolve bug".to_string(),
+            ],
+            urgency: SyncUrgency::Helpful,
+        };
+
+        let formatted = msg.format_for_injection();
+
+        assert!(formatted.contains("rebase-notification"));
+        assert!(formatted.contains("Helpful"));
+        assert!(formatted.contains("commits_behind=\"3\""));
+        assert!(formatted.contains("3 new commit(s)"));
+        assert!(formatted.contains("abc123: feat: add new API"));
+        assert!(formatted.contains("def456: fix: resolve bug"));
+    }
+
+    #[test]
+    fn test_injected_message_rebase_empty_commits() {
+        let msg = InjectedMessage::Rebase {
+            commits_behind: 1,
+            new_commits: vec![],
+            urgency: SyncUrgency::Fyi,
+        };
+
+        let formatted = msg.format_for_injection();
+
+        assert!(formatted.contains("rebase-notification"));
+        assert!(formatted.contains("Fyi"));
+        assert!(formatted.contains("commits_behind=\"1\""));
+        assert!(formatted.contains("1 new commit(s)"));
+        // Should not have the "Recent commits" section
+        assert!(!formatted.contains("Recent commits"));
     }
 }
