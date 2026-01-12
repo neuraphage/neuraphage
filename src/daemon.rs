@@ -14,7 +14,7 @@ use crate::executor::{Activity, ExecutionEvent, ExecutionStatus, ExecutorConfig}
 use crate::git::{MergeQueue, MergeRequest, WorktreeInfo};
 use crate::supervised::{SupervisedExecutor, SupervisedExecutorConfig};
 use crate::task::{Task, TaskId, TaskStatus};
-use crate::task_manager::TaskManager;
+use crate::tasks::TaskManager;
 
 /// DTO for worktree info (serializable version of WorktreeInfo).
 #[derive(Debug, Clone, Serialize, Deserialize)]

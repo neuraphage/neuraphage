@@ -6,12 +6,12 @@
 //! - Event bus: Inter-task communication
 //! - Knowledge store: Learning extraction and injection
 
-pub mod event_bus;
+pub mod events;
 pub mod knowledge;
-pub mod lock_manager;
+pub mod locks;
 pub mod scheduler;
 
-pub use event_bus::{Event, EventBus, EventKind};
+pub use events::{Event, EventBus, EventKind};
 pub use knowledge::{Knowledge, KnowledgeKind, KnowledgeStore};
-pub use lock_manager::{Lock, LockManager, LockResult, ResourceId};
+pub use locks::{Lock, LockManager, LockResult, ResourceId};
 pub use scheduler::{ScheduleResult, Scheduler, SchedulerConfig};

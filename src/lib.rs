@@ -17,14 +17,14 @@ pub mod safety;
 pub mod sandbox;
 pub mod supervised;
 pub mod task;
-pub mod task_manager;
+pub mod tasks;
 pub mod ui;
 
 pub use config::Config;
 pub use daemon::{Daemon, DaemonConfig};
 pub use error::{Error, Result};
 pub use task::{Task, TaskId, TaskStatus};
-pub use task_manager::{TaskCounts, TaskManager};
+pub use tasks::{TaskCounts, TaskManager};
 
 // Re-export agentic types
 pub use agentic::{AgenticConfig, AgenticLoop, Conversation, IterationResult, Message, MessageRole};
