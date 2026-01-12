@@ -342,7 +342,7 @@ pub struct GlobalStats {
 }
 
 /// Filter for workstream list.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct WorkstreamFilter {
     /// Filter by status.
     pub status: Option<TaskStatus>,
@@ -352,6 +352,21 @@ pub struct WorkstreamFilter {
     pub attention_only: bool,
     /// Filter to specific task IDs (empty = show all).
     pub task_ids: Vec<String>,
+    /// Only show active tasks (Running, WaitingForUser, Queued, Blocked).
+    /// Default: true - hide completed/failed/cancelled tasks.
+    pub active_only: bool,
+}
+
+impl Default for WorkstreamFilter {
+    fn default() -> Self {
+        Self {
+            status: None,
+            name_filter: None,
+            attention_only: false,
+            task_ids: Vec::new(),
+            active_only: true, // Default to hiding completed/cancelled tasks
+        }
+    }
 }
 
 /// A single workstream being tracked.
@@ -780,6 +795,15 @@ impl ParallelTuiState {
         self.workstreams
             .iter()
             .filter(|w| {
+                // Apply active_only filter (hide completed/failed/cancelled)
+                if self.filter.active_only {
+                    match w.status {
+                        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled => {
+                            return false;
+                        }
+                        _ => {}
+                    }
+                }
                 // Apply status filter
                 if let Some(status) = self.filter.status
                     && w.status != status
@@ -854,6 +878,28 @@ impl ParallelTuiState {
             SortOrder::Name => SortOrder::Status,
         };
         self.sort_workstreams();
+    }
+
+    /// Scroll conversation up for selected workstream.
+    pub fn scroll_conversation_up(&mut self, amount: usize) {
+        let filtered_ids: Vec<_> = self.filtered_workstreams().iter().map(|w| w.task_id.clone()).collect();
+        if let Some(task_id) = filtered_ids.get(self.primary_focus)
+            && let Some(ws) = self.workstreams.iter_mut().find(|w| &w.task_id == task_id)
+        {
+            ws.scroll_conversation_up(amount);
+        }
+    }
+
+    /// Scroll conversation down for selected workstream.
+    pub fn scroll_conversation_down(&mut self, amount: usize) {
+        let filtered_ids: Vec<_> = self.filtered_workstreams().iter().map(|w| w.task_id.clone()).collect();
+        if let Some(task_id) = filtered_ids.get(self.primary_focus)
+            && let Some(ws) = self.workstreams.iter_mut().find(|w| &w.task_id == task_id)
+        {
+            // Calculate max scroll based on conversation length
+            let max_scroll = ws.conversation.len().saturating_sub(10);
+            ws.scroll_conversation_down(amount, max_scroll);
+        }
     }
 
     /// Sort workstreams by current sort order.
@@ -1018,6 +1064,9 @@ impl ParallelTuiApp {
             // Navigation
             KeyCode::Char('j') | KeyCode::Down => self.state.next_workstream(),
             KeyCode::Char('k') | KeyCode::Up => self.state.prev_workstream(),
+            // Scroll conversation (Shift+J/K or PgUp/PgDn)
+            KeyCode::Char('J') | KeyCode::PageDown => self.state.scroll_conversation_down(5),
+            KeyCode::Char('K') | KeyCode::PageUp => self.state.scroll_conversation_up(5),
 
             // Number keys for quick jump
             KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
@@ -1046,6 +1095,10 @@ impl ParallelTuiApp {
             KeyCode::Char('f') => {
                 // Toggle attention filter
                 self.state.filter.attention_only = !self.state.filter.attention_only;
+            }
+            KeyCode::Char('A') => {
+                // Toggle showing all tasks vs active only (Shift+A)
+                self.state.filter.active_only = !self.state.filter.active_only;
             }
 
             // Help
@@ -1883,6 +1936,8 @@ impl ParallelTuiApp {
             Line::from(vec!["  1-9".cyan(), " │ Jump to workstream by index".into()]),
             Line::from(vec!["  j/↓".cyan(), " │ Next workstream".into()]),
             Line::from(vec!["  k/↑".cyan(), " │ Previous workstream".into()]),
+            Line::from(vec!["  J/K".cyan(), " │ Scroll conversation up/down".into()]),
+            Line::from(vec!["PgUp/Dn".cyan(), "│ Scroll conversation".into()]),
             Line::from(vec!["  Tab".cyan(), " │ Cycle focus in split mode".into()]),
             Line::from(""),
             Line::from(vec![
@@ -1904,6 +1959,7 @@ impl ParallelTuiApp {
             Line::from(vec!["    /".cyan(), " │ Search/filter workstreams".into()]),
             Line::from(vec!["    t".cyan(), " │ View task events".into()]),
             Line::from(vec!["    f".cyan(), " │ Toggle attention filter".into()]),
+            Line::from(vec!["    A".cyan(), " │ Show all tasks (incl. done)".into()]),
             Line::from(""),
             Line::from(vec![
                 "─────────── ".dark_gray(),
@@ -1919,14 +1975,17 @@ impl ParallelTuiApp {
             Line::from(""),
             Line::from(vec![
                 "─────────── ".dark_gray(),
-                "Mode Indicators".bold().cyan(),
-                " ────────".dark_gray(),
+                "Status Icons".bold().cyan(),
+                " ───────────".dark_gray(),
             ]),
-            Line::from(vec!["  ●".green(), " Running".into()]),
-            Line::from(vec!["  ?".yellow(), " Waiting for user".into()]),
-            Line::from(vec!["  ○".dark_gray(), " Queued".into()]),
+            Line::from(vec!["  ●".green(), " Running (active)".into()]),
+            Line::from(vec!["  ?".yellow(), " Waiting for user input".into()]),
+            Line::from(vec!["  ○".dark_gray(), " Queued (pending)".into()]),
+            Line::from(vec!["  ◌".red(), " Blocked (dependency)".into()]),
+            Line::from(vec!["  ◑".yellow(), " Paused".into()]),
             Line::from(vec!["  ✓".green(), " Completed".into()]),
             Line::from(vec!["  ✗".red(), " Failed".into()]),
+            Line::from(vec!["  ⊘".dark_gray(), " Cancelled".into()]),
             Line::from(""),
             Line::from("Press ESC or ? to close".dark_gray().italic()),
         ];
