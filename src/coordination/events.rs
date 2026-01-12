@@ -461,6 +461,12 @@ impl EventBus {
         .await;
     }
 
+    /// Publish a task cancelled event.
+    pub async fn task_cancelled(&self, task_id: TaskId) {
+        self.publish(Event::new(EventKind::TaskCancelled).from_task(task_id))
+            .await;
+    }
+
     /// Publish a file modified event.
     pub async fn file_modified(&self, task_id: TaskId, path: &str) {
         self.publish(

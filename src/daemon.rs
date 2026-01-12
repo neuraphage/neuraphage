@@ -647,6 +647,20 @@ impl Daemon {
                     let task_id = result.task_id.clone();
                     log::info!("Task {} completed with status: {:?}", task_id.0, result.status);
 
+                    // Publish completion event
+                    match &result.status {
+                        ExecutionStatus::Completed { reason } => {
+                            supervised_executor.event_bus().task_completed(task_id.clone(), reason).await;
+                        }
+                        ExecutionStatus::Failed { error } => {
+                            supervised_executor.event_bus().task_failed(task_id.clone(), error).await;
+                        }
+                        ExecutionStatus::Cancelled => {
+                            supervised_executor.event_bus().task_cancelled(task_id.clone()).await;
+                        }
+                        _ => {}
+                    }
+
                     // Update TaskManager status
                     let new_status = match &result.status {
                         ExecutionStatus::Completed { reason: _ } => TaskStatus::Completed,
@@ -998,8 +1012,11 @@ async fn process_request(
             let mut exec = supervised_executor.executor().lock().await;
             match exec.cancel_task(&task_id) {
                 Ok(()) => {
-                    // Clean up supervision state
+                    // Publish TaskCancelled event
                     drop(exec);
+                    supervised_executor.event_bus().task_cancelled(task_id.clone()).await;
+
+                    // Clean up supervision state
                     supervised_executor.cleanup_task(&task_id).await;
 
                     // Update task status to Cancelled

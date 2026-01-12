@@ -264,6 +264,9 @@ impl SupervisedExecutor {
             executor.start_task(task, working_dir.clone())?;
         }
 
+        // Publish TaskStarted event
+        self.event_bus.task_started(task_id.clone()).await;
+
         // Track start time for debouncing
         {
             let mut start_times = self.task_start_times.write().await;
