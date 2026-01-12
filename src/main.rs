@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 mod cli;
 
-use cli::{Cli, Command, CostCommand, DaemonCommand, MergeCommand, WorktreeCommand};
+use cli::{Cli, Command, CostCommand, DaemonCommand, MergeCommand, RebaseCommand, WorktreeCommand};
 use neuraphage::config::Config;
 use neuraphage::daemon::{
     ActivityDto, Daemon, DaemonClient, DaemonRequest, DaemonResponse, ExecutionEventDto, ExecutionStatusDto,
@@ -739,6 +739,51 @@ async fn run_client_command(config: &Config, command: Command) -> Result<()> {
             }
         },
         Command::Cost(_) => unreachable!("Cost commands handled before daemon check"),
+
+        Command::Rebase(rebase_cmd) => match rebase_cmd {
+            RebaseCommand::Status => {
+                let request = DaemonRequest::GetRebaseStatus;
+                let response = client.request(request).await?;
+                match response {
+                    DaemonResponse::RebaseStatus { tasks } => {
+                        if tasks.is_empty() {
+                            println!("{} No tasks with rebase status", "○".yellow());
+                        } else {
+                            println!("{} Rebase Status", "🔄".blue());
+                            println!();
+                            for task in tasks {
+                                let status_icon = if task.needs_rebase { "!".yellow() } else { "✓".green() };
+                                println!(
+                                    "  {} {} ({}) - {} commits behind",
+                                    status_icon, task.task_id.cyan(), task.branch, task.commits_behind
+                                );
+                            }
+                        }
+                    }
+                    DaemonResponse::Error { message } => eprintln!("{} {}", "✗".red(), message),
+                    _ => {}
+                }
+            }
+            RebaseCommand::Trigger { id } => {
+                let request = DaemonRequest::TriggerRebase { id: id.clone() };
+                let response = client.request(request).await?;
+                match response {
+                    DaemonResponse::RebaseResult {
+                        task_id,
+                        success,
+                        message,
+                    } => {
+                        if success {
+                            println!("{} Task {} rebased: {}", "✓".green(), task_id.cyan(), message);
+                        } else {
+                            println!("{} Task {} rebase failed: {}", "✗".red(), task_id.cyan(), message);
+                        }
+                    }
+                    DaemonResponse::Error { message } => eprintln!("{} {}", "✗".red(), message),
+                    _ => {}
+                }
+            }
+        },
     }
 
     Ok(())

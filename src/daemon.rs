@@ -64,6 +64,19 @@ pub struct RecoverableTaskDto {
     pub started_reason: String,
 }
 
+/// DTO for task rebase status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRebaseStatusDto {
+    /// Task ID.
+    pub task_id: String,
+    /// Number of commits behind main.
+    pub commits_behind: usize,
+    /// Whether a rebase is needed.
+    pub needs_rebase: bool,
+    /// Branch name.
+    pub branch: String,
+}
+
 /// Daemon configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonConfig {
@@ -184,6 +197,10 @@ pub enum DaemonRequest {
     GetRecoveryReport,
     /// Resume a task from its last checkpoint.
     ResumeTask { id: String },
+    /// Get rebase status for all tasks.
+    GetRebaseStatus,
+    /// Trigger a rebase for a specific task.
+    TriggerRebase { id: String },
     /// Shutdown daemon.
     Shutdown,
 }
@@ -240,6 +257,14 @@ pub enum DaemonResponse {
     RecoveryReport { tasks: Vec<RecoverableTaskDto> },
     /// Task resumed from checkpoint.
     TaskResumed { task_id: String },
+    /// Rebase status for all tasks.
+    RebaseStatus { tasks: Vec<TaskRebaseStatusDto> },
+    /// Rebase result for a specific task.
+    RebaseResult {
+        task_id: String,
+        success: bool,
+        message: String,
+    },
     /// Shutdown acknowledgment.
     Shutdown,
 }
@@ -1143,6 +1168,42 @@ async fn process_request(
                     let mut mgr = manager.lock().await;
                     let _ = mgr.set_status(&task_id, TaskStatus::Running);
                     DaemonResponse::TaskResumed { task_id: id }
+                }
+                Err(e) => DaemonResponse::Error { message: e.to_string() },
+            }
+        }
+
+        DaemonRequest::GetRebaseStatus => {
+            let statuses = supervised_executor.get_all_rebase_status().await;
+            let tasks: Vec<TaskRebaseStatusDto> = statuses
+                .into_iter()
+                .map(|s| TaskRebaseStatusDto {
+                    task_id: s.task_id,
+                    commits_behind: s.commits_behind,
+                    needs_rebase: s.commits_behind > 0,
+                    branch: s.branch,
+                })
+                .collect();
+            DaemonResponse::RebaseStatus { tasks }
+        }
+
+        DaemonRequest::TriggerRebase { id } => {
+            let task_id = TaskId::from_engram_id(&id);
+            match supervised_executor.trigger_rebase(&task_id).await {
+                Ok(result) => {
+                    let (success, message) = match result {
+                        crate::git::RebaseResult::Success { previous_head, new_head } => {
+                            (true, format!("Rebased from {} to {}", &previous_head[..8], &new_head[..8]))
+                        }
+                        crate::git::RebaseResult::Conflict { details, .. } => (false, format!("Conflict: {}", details)),
+                        crate::git::RebaseResult::Failed { reason } => (false, format!("Failed: {}", reason)),
+                        crate::git::RebaseResult::Skipped { reason } => (true, format!("Skipped: {}", reason)),
+                    };
+                    DaemonResponse::RebaseResult {
+                        task_id: id,
+                        success,
+                        message,
+                    }
                 }
                 Err(e) => DaemonResponse::Error { message: e.to_string() },
             }

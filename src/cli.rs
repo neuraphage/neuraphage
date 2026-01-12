@@ -276,6 +276,10 @@ pub enum Command {
     /// View cost statistics and budget usage
     #[command(subcommand)]
     Cost(CostCommand),
+
+    /// Manage proactive rebasing against main
+    #[command(subcommand)]
+    Rebase(RebaseCommand),
 }
 
 /// Worktree management commands.
@@ -331,6 +335,19 @@ pub enum CostCommand {
 
     /// Show cost for a specific task
     Task {
+        /// Task ID
+        id: String,
+    },
+}
+
+/// Rebase commands for proactive main-tracking.
+#[derive(Subcommand)]
+pub enum RebaseCommand {
+    /// Show rebase status for all tasks
+    Status,
+
+    /// Trigger rebase for a specific task
+    Trigger {
         /// Task ID
         id: String,
     },
@@ -491,6 +508,22 @@ mod tests {
             assert_eq!(id, "task-123");
         } else {
             panic!("Expected Cost Task command");
+        }
+    }
+
+    #[test]
+    fn test_rebase_status() {
+        let cli = Cli::parse_from(["np", "rebase", "status"]);
+        assert!(matches!(cli.command, Some(Command::Rebase(RebaseCommand::Status))));
+    }
+
+    #[test]
+    fn test_rebase_trigger() {
+        let cli = Cli::parse_from(["np", "rebase", "trigger", "task-123"]);
+        if let Some(Command::Rebase(RebaseCommand::Trigger { id })) = cli.command {
+            assert_eq!(id, "task-123");
+        } else {
+            panic!("Expected Rebase Trigger command");
         }
     }
 }
