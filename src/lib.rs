@@ -6,6 +6,7 @@
 pub mod agentic;
 pub mod config;
 pub mod coordination;
+pub mod cost;
 pub mod daemon;
 pub mod error;
 pub mod executor;
@@ -73,3 +74,6 @@ pub use supervised::{
 // Re-export recovery types
 pub mod recovery;
 pub use recovery::{ExecutionStateStore, PersistedExecutionState};
+
+// Re-export cost tracking types
+pub use cost::{BudgetCheck, BudgetType, CostEntry, CostStats, CostTracker};
