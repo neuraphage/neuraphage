@@ -236,6 +236,19 @@ pub enum ExecutionEvent {
     ToolStarted { name: String },
     /// Tool execution completed.
     ToolCompleted { name: String, result: String },
+    /// Budget warning threshold crossed.
+    BudgetWarning {
+        budget_type: String,
+        threshold: f64,
+        current: f64,
+        limit: f64,
+    },
+    /// Budget exceeded - task should stop.
+    BudgetExceeded {
+        budget_type: String,
+        current: f64,
+        limit: f64,
+    },
 }
 
 /// Handle to a running task.

@@ -847,6 +847,42 @@ fn handle_execution_event(event: &ExecutionEventDto, mid_line: &mut bool) {
             println!("  {} {}", "✓".green(), name);
             println!("  {}", display.dimmed());
         }
+        ExecutionEventDto::BudgetWarning {
+            budget_type,
+            threshold,
+            current,
+            limit,
+        } => {
+            if *mid_line {
+                println!();
+                *mid_line = false;
+            }
+            println!(
+                "{} Budget warning: {} at {:.0}% (${:.2}/${:.2})",
+                "⚠".yellow(),
+                budget_type,
+                threshold * 100.0,
+                current,
+                limit
+            );
+        }
+        ExecutionEventDto::BudgetExceeded {
+            budget_type,
+            current,
+            limit,
+        } => {
+            if *mid_line {
+                println!();
+                *mid_line = false;
+            }
+            println!(
+                "{} Budget exceeded: {} (${:.2}/${:.2})",
+                "✗".red(),
+                budget_type,
+                current,
+                limit
+            );
+        }
     }
 }
 

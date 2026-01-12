@@ -288,6 +288,19 @@ pub enum ExecutionEventDto {
     ToolStarted { name: String },
     /// Tool execution completed.
     ToolCompleted { name: String, result: String },
+    /// Budget warning threshold reached.
+    BudgetWarning {
+        budget_type: String,
+        threshold: f64,
+        current: f64,
+        limit: f64,
+    },
+    /// Budget exceeded.
+    BudgetExceeded {
+        budget_type: String,
+        current: f64,
+        limit: f64,
+    },
 }
 
 impl From<ExecutionEvent> for ExecutionEventDto {
@@ -313,6 +326,26 @@ impl From<ExecutionEvent> for ExecutionEventDto {
             },
             ExecutionEvent::ToolStarted { name } => ExecutionEventDto::ToolStarted { name },
             ExecutionEvent::ToolCompleted { name, result } => ExecutionEventDto::ToolCompleted { name, result },
+            ExecutionEvent::BudgetWarning {
+                budget_type,
+                threshold,
+                current,
+                limit,
+            } => ExecutionEventDto::BudgetWarning {
+                budget_type,
+                threshold,
+                current,
+                limit,
+            },
+            ExecutionEvent::BudgetExceeded {
+                budget_type,
+                current,
+                limit,
+            } => ExecutionEventDto::BudgetExceeded {
+                budget_type,
+                current,
+                limit,
+            },
         }
     }
 }
