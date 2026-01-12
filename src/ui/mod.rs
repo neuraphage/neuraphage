@@ -12,7 +12,8 @@ pub mod tui;
 
 pub use notifications::{Notification, NotificationKind, Notifier};
 pub use parallel_tui::{
-    AttentionLevel, BudgetStatus, ConnectionStatus, EventImportance, GlobalStats, LayoutMode, OutputLine, ParallelTui,
-    ParallelTuiApp, ParallelTuiState, SortOrder, TimelineEvent, Workstream, WorkstreamFilter,
+    AttentionLevel, BudgetStatus, ConfirmAction, ConfirmDialog, ConnectionStatus, EventImportance, GlobalStats,
+    InteractionMode, LayoutMode, OutputLine, ParallelTui, ParallelTuiApp, ParallelTuiState, SortOrder, TimelineEvent,
+    Workstream, WorkstreamFilter,
 };
 pub use tui::{App, AppState, Tui};

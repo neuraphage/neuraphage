@@ -475,6 +475,76 @@ impl Workstream {
     }
 }
 
+/// Interaction mode for the TUI.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum InteractionMode {
+    /// Normal navigation mode.
+    #[default]
+    Normal,
+    /// Input mode - sending text to a workstream.
+    Input(String),
+    /// Search/filter mode.
+    Search(String),
+    /// Confirmation dialog.
+    Confirm(ConfirmDialog),
+    /// Task-specific events viewer.
+    TaskEvents,
+}
+
+/// Confirmation dialog for destructive actions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmDialog {
+    /// Dialog title.
+    pub title: String,
+    /// Dialog message.
+    pub message: String,
+    /// Action to perform if confirmed.
+    pub action: ConfirmAction,
+    /// Currently selected option (true = confirm, false = cancel).
+    pub selected: bool,
+}
+
+impl ConfirmDialog {
+    /// Create a new confirmation dialog.
+    pub fn new(title: impl Into<String>, message: impl Into<String>, action: ConfirmAction) -> Self {
+        Self {
+            title: title.into(),
+            message: message.into(),
+            action,
+            selected: false, // Default to cancel for safety
+        }
+    }
+
+    /// Create a cancel task dialog.
+    pub fn cancel_task(task_id: &TaskId) -> Self {
+        Self::new(
+            "Cancel Task",
+            format!("Are you sure you want to cancel task '{}'?", task_id.0),
+            ConfirmAction::CancelTask(task_id.clone()),
+        )
+    }
+
+    /// Create a quit dialog.
+    pub fn quit_with_running() -> Self {
+        Self::new(
+            "Quit",
+            "There are still running tasks. Are you sure you want to quit?",
+            ConfirmAction::Quit,
+        )
+    }
+}
+
+/// Action to perform after confirmation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmAction {
+    /// Cancel a task.
+    CancelTask(TaskId),
+    /// Quit the TUI.
+    Quit,
+    /// Pause a task.
+    PauseTask(TaskId),
+}
+
 /// TUI application state for parallel workstreams.
 #[derive(Debug, Clone)]
 pub struct ParallelTuiState {
@@ -506,6 +576,8 @@ pub struct ParallelTuiState {
     max_timeline_events: usize,
     /// Frame counter for animations (wraps at 60).
     frame_counter: u8,
+    /// Current interaction mode.
+    pub interaction_mode: InteractionMode,
 }
 
 impl Default for ParallelTuiState {
@@ -537,6 +609,48 @@ impl ParallelTuiState {
             connection_status: ConnectionStatus::Connected,
             max_timeline_events: settings.max_timeline_events,
             frame_counter: 0,
+            interaction_mode: InteractionMode::Normal,
+        }
+    }
+
+    /// Enter input mode for the selected workstream.
+    pub fn enter_input_mode(&mut self) {
+        self.interaction_mode = InteractionMode::Input(String::new());
+    }
+
+    /// Enter search mode.
+    pub fn enter_search_mode(&mut self) {
+        self.interaction_mode = InteractionMode::Search(String::new());
+    }
+
+    /// Enter task events view for the selected workstream.
+    pub fn enter_task_events_mode(&mut self) {
+        self.interaction_mode = InteractionMode::TaskEvents;
+    }
+
+    /// Show a confirmation dialog.
+    pub fn show_confirm(&mut self, dialog: ConfirmDialog) {
+        self.interaction_mode = InteractionMode::Confirm(dialog);
+    }
+
+    /// Exit current interaction mode back to normal.
+    pub fn exit_interaction_mode(&mut self) {
+        self.interaction_mode = InteractionMode::Normal;
+    }
+
+    /// Check if in normal navigation mode.
+    pub fn is_normal_mode(&self) -> bool {
+        matches!(self.interaction_mode, InteractionMode::Normal)
+    }
+
+    /// Apply current search filter.
+    pub fn apply_search(&mut self) {
+        if let InteractionMode::Search(ref query) = self.interaction_mode {
+            if query.is_empty() {
+                self.filter.name_filter = None;
+            } else {
+                self.filter.name_filter = Some(query.clone());
+            }
         }
     }
 
@@ -796,12 +910,24 @@ impl ParallelTuiApp {
 
     /// Handle key press.
     fn handle_key(&mut self, key: KeyEvent) {
-        // Handle Ctrl+C
+        // Handle Ctrl+C always
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.should_quit = true;
             return;
         }
 
+        // Handle based on current interaction mode
+        match &self.state.interaction_mode {
+            InteractionMode::Normal => self.handle_normal_mode(key),
+            InteractionMode::Input(_) => self.handle_input_mode(key),
+            InteractionMode::Search(_) => self.handle_search_mode(key),
+            InteractionMode::Confirm(_) => self.handle_confirm_mode(key),
+            InteractionMode::TaskEvents => self.handle_task_events_mode(key),
+        }
+    }
+
+    /// Handle keys in normal navigation mode.
+    fn handle_normal_mode(&mut self, key: KeyEvent) {
         // Handle help overlay escape
         if self.state.show_help {
             match key.code {
@@ -814,8 +940,14 @@ impl ParallelTuiApp {
         }
 
         match key.code {
-            // Quit
-            KeyCode::Char('q') => self.should_quit = true,
+            // Quit (with confirm if tasks running)
+            KeyCode::Char('q') => {
+                if self.state.stats.running_count > 0 {
+                    self.state.show_confirm(ConfirmDialog::quit_with_running());
+                } else {
+                    self.should_quit = true;
+                }
+            }
 
             // Navigation
             KeyCode::Char('j') | KeyCode::Down => self.state.next_workstream(),
@@ -833,6 +965,23 @@ impl ParallelTuiApp {
             KeyCode::Char('d') => self.state.layout_mode = LayoutMode::Dashboard,
             KeyCode::Enter => self.state.toggle_layout(LayoutMode::Focus),
 
+            // Interaction modes
+            KeyCode::Char('a') => self.state.enter_input_mode(),
+            KeyCode::Char('/') => self.state.enter_search_mode(),
+            KeyCode::Char('t') => self.state.enter_task_events_mode(),
+
+            // Actions
+            KeyCode::Char('x') => {
+                // Cancel selected task (with confirm)
+                if let Some(workstream) = self.state.selected() {
+                    self.state.show_confirm(ConfirmDialog::cancel_task(&workstream.task_id));
+                }
+            }
+            KeyCode::Char('f') => {
+                // Toggle attention filter
+                self.state.filter.attention_only = !self.state.filter.attention_only;
+            }
+
             // Help
             KeyCode::Char('?') => self.state.show_help = true,
             KeyCode::Esc => {
@@ -848,15 +997,113 @@ impl ParallelTuiApp {
 
             // Tab to cycle between panes in split/grid mode
             KeyCode::Tab => {
-                if self.state.layout_mode == LayoutMode::Split {
-                    // Swap primary and secondary focus
-                    if let Some(secondary) = self.state.secondary_focus {
-                        self.state.secondary_focus = Some(self.state.primary_focus);
-                        self.state.primary_focus = secondary;
-                    }
+                if self.state.layout_mode == LayoutMode::Split
+                    && let Some(secondary) = self.state.secondary_focus
+                {
+                    self.state.secondary_focus = Some(self.state.primary_focus);
+                    self.state.primary_focus = secondary;
                 }
             }
 
+            _ => {}
+        }
+    }
+
+    /// Handle keys in input mode.
+    fn handle_input_mode(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.state.exit_interaction_mode(),
+            KeyCode::Enter => {
+                // Send input to workstream (placeholder - daemon integration needed)
+                // For now, just exit input mode
+                self.state.exit_interaction_mode();
+            }
+            KeyCode::Backspace => {
+                if let InteractionMode::Input(ref mut text) = self.state.interaction_mode {
+                    text.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if let InteractionMode::Input(ref mut text) = self.state.interaction_mode {
+                    text.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle keys in search mode.
+    fn handle_search_mode(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.state.filter.name_filter = None;
+                self.state.exit_interaction_mode();
+            }
+            KeyCode::Enter => {
+                self.state.apply_search();
+                self.state.exit_interaction_mode();
+            }
+            KeyCode::Backspace => {
+                if let InteractionMode::Search(ref mut text) = self.state.interaction_mode {
+                    text.pop();
+                    // Apply search in real-time
+                    self.state.filter.name_filter = if text.is_empty() { None } else { Some(text.clone()) };
+                }
+            }
+            KeyCode::Char(c) => {
+                if let InteractionMode::Search(ref mut text) = self.state.interaction_mode {
+                    text.push(c);
+                    // Apply search in real-time
+                    self.state.filter.name_filter = Some(text.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle keys in confirmation dialog.
+    fn handle_confirm_mode(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.state.exit_interaction_mode();
+            }
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                // Execute the confirmed action
+                if let InteractionMode::Confirm(ref dialog) = self.state.interaction_mode {
+                    match &dialog.action {
+                        ConfirmAction::Quit => self.should_quit = true,
+                        ConfirmAction::CancelTask(_task_id) => {
+                            // Placeholder - daemon integration needed
+                        }
+                        ConfirmAction::PauseTask(_task_id) => {
+                            // Placeholder - daemon integration needed
+                        }
+                    }
+                }
+                self.state.exit_interaction_mode();
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                // Toggle selection
+                if let InteractionMode::Confirm(ref mut dialog) = self.state.interaction_mode {
+                    dialog.selected = !dialog.selected;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle keys in task events mode.
+    fn handle_task_events_mode(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('t') => {
+                self.state.exit_interaction_mode();
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                // Scroll down in events (placeholder)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                // Scroll up in events (placeholder)
+            }
             _ => {}
         }
     }
@@ -874,6 +1121,168 @@ impl ParallelTuiApp {
         if self.state.show_help {
             self.render_help_popup(frame);
         }
+
+        // Render interaction mode overlays
+        match &self.state.interaction_mode {
+            InteractionMode::Input(text) => self.render_input_bar(frame, text),
+            InteractionMode::Search(text) => self.render_search_bar(frame, text),
+            InteractionMode::Confirm(dialog) => self.render_confirm_dialog(frame, dialog),
+            InteractionMode::TaskEvents => self.render_task_events_overlay(frame),
+            InteractionMode::Normal => {}
+        }
+    }
+
+    /// Render input bar at bottom of screen.
+    fn render_input_bar(&self, frame: &mut Frame, text: &str) {
+        let area = frame.area();
+        let bar_area = Rect::new(0, area.height.saturating_sub(2), area.width, 2);
+
+        let task_name = self.state.selected().map(|w| w.name.as_str()).unwrap_or("none");
+
+        let block = Block::default()
+            .title(format!(" Send to [{}] ", task_name))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan));
+
+        let inner = block.inner(bar_area);
+
+        // Clear the area first
+        frame.render_widget(Clear, bar_area);
+        frame.render_widget(block, bar_area);
+
+        // Render input text with cursor
+        let input = Paragraph::new(format!("{}_", text)).style(Style::default().fg(Color::White));
+        frame.render_widget(input, inner);
+    }
+
+    /// Render search bar at bottom of screen.
+    fn render_search_bar(&self, frame: &mut Frame, text: &str) {
+        let area = frame.area();
+        let bar_area = Rect::new(0, area.height.saturating_sub(2), area.width, 2);
+
+        let matches = self.state.filtered_workstreams().len();
+
+        let block = Block::default()
+            .title(format!(" Search ({} matches) ", matches))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow));
+
+        let inner = block.inner(bar_area);
+
+        frame.render_widget(Clear, bar_area);
+        frame.render_widget(block, bar_area);
+
+        let input = Paragraph::new(format!("/{}_", text)).style(Style::default().fg(Color::White));
+        frame.render_widget(input, inner);
+    }
+
+    /// Render confirmation dialog.
+    fn render_confirm_dialog(&self, frame: &mut Frame, dialog: &ConfirmDialog) {
+        let area = frame.area();
+        let dialog_width = 50.min(area.width.saturating_sub(4));
+        let dialog_height = 6;
+
+        let x = (area.width.saturating_sub(dialog_width)) / 2;
+        let y = (area.height.saturating_sub(dialog_height)) / 2;
+        let dialog_area = Rect::new(x, y, dialog_width, dialog_height);
+
+        let block = Block::default()
+            .title(format!(" {} ", dialog.title))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Red));
+
+        let inner = block.inner(dialog_area);
+
+        frame.render_widget(Clear, dialog_area);
+        frame.render_widget(block, dialog_area);
+
+        // Message and buttons layout
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(inner);
+
+        let message = Paragraph::new(&*dialog.message).wrap(Wrap { trim: true });
+        frame.render_widget(message, layout[0]);
+
+        // Buttons
+        let yes_style = if dialog.selected {
+            Style::default().fg(Color::White).bg(Color::Red)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let no_style = if !dialog.selected {
+            Style::default().fg(Color::White).bg(Color::Blue)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        let buttons = Line::from(vec![
+            Span::styled(" [Y]es ", yes_style),
+            Span::raw("  "),
+            Span::styled(" [N]o ", no_style),
+        ]);
+        frame.render_widget(
+            Paragraph::new(buttons).alignment(ratatui::layout::Alignment::Center),
+            layout[1],
+        );
+    }
+
+    /// Render task events overlay.
+    fn render_task_events_overlay(&self, frame: &mut Frame) {
+        let area = frame.area();
+        let overlay_width = (area.width as f32 * 0.6) as u16;
+        let overlay_height = (area.height as f32 * 0.7) as u16;
+
+        let x = (area.width.saturating_sub(overlay_width)) / 2;
+        let y = (area.height.saturating_sub(overlay_height)) / 2;
+        let overlay_area = Rect::new(x, y, overlay_width, overlay_height);
+
+        let task_name = self.state.selected().map(|w| w.name.as_str()).unwrap_or("none");
+
+        let block = Block::default()
+            .title(format!(" Events for [{}] (press t/Esc to close) ", task_name))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan));
+
+        let inner = block.inner(overlay_area);
+
+        frame.render_widget(Clear, overlay_area);
+        frame.render_widget(block, overlay_area);
+
+        // Get events for selected task
+        let selected_task = self.state.selected().map(|w| &w.task_id);
+        let events: Vec<_> = self
+            .state
+            .event_timeline
+            .iter()
+            .filter(|e| {
+                if let Some(task_id) = selected_task {
+                    e.task_ids.contains(task_id) || e.task_ids.is_empty()
+                } else {
+                    true
+                }
+            })
+            .collect();
+
+        let items: Vec<ListItem> = events
+            .iter()
+            .rev()
+            .take(inner.height as usize)
+            .map(|e| {
+                let time = e.timestamp.format("%H:%M:%S").to_string();
+                let line = Line::from(vec![
+                    Span::styled(format!("{} ", e.icon), Style::default().fg(Color::Cyan)),
+                    Span::styled(time, Style::default().fg(Color::DarkGray)),
+                    Span::raw(" "),
+                    Span::raw(&e.description),
+                ]);
+                ListItem::new(line)
+            })
+            .collect();
+
+        let list = List::new(items);
+        frame.render_widget(list, inner);
     }
 
     /// Render dashboard layout.
@@ -1544,8 +1953,11 @@ mod tests {
         app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
         assert!(!app.state.show_help);
 
-        // Test quit
+        // Test quit - with running tasks, should show confirm dialog
         app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
+        assert!(matches!(app.state.interaction_mode, InteractionMode::Confirm(_)));
+        // Confirm quit
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)));
         assert!(app.should_quit);
     }
 
@@ -1746,5 +2158,146 @@ mod tests {
         assert!(AttentionLevel::Subtle < AttentionLevel::Warning);
         assert!(AttentionLevel::Warning < AttentionLevel::Urgent);
         assert!(AttentionLevel::Urgent < AttentionLevel::Critical);
+    }
+
+    #[test]
+    fn test_interaction_mode_default() {
+        let state = ParallelTuiState::new();
+        assert_eq!(state.interaction_mode, InteractionMode::Normal);
+        assert!(state.is_normal_mode());
+    }
+
+    #[test]
+    fn test_enter_input_mode() {
+        let mut state = ParallelTuiState::new();
+        state.enter_input_mode();
+        assert!(matches!(state.interaction_mode, InteractionMode::Input(_)));
+        assert!(!state.is_normal_mode());
+
+        state.exit_interaction_mode();
+        assert_eq!(state.interaction_mode, InteractionMode::Normal);
+    }
+
+    #[test]
+    fn test_enter_search_mode() {
+        let mut state = ParallelTuiState::new();
+        state.add_workstream(test_workstream("task-1", "Auth feature", TaskStatus::Running));
+        state.add_workstream(test_workstream("task-2", "API refactor", TaskStatus::Queued));
+
+        state.enter_search_mode();
+        assert!(matches!(state.interaction_mode, InteractionMode::Search(_)));
+
+        // Simulate typing
+        if let InteractionMode::Search(ref mut text) = state.interaction_mode {
+            text.push_str("API");
+        }
+        state.apply_search();
+
+        // Search should filter results
+        assert_eq!(state.filter.name_filter, Some("API".to_string()));
+        assert_eq!(state.filtered_workstreams().len(), 1);
+    }
+
+    #[test]
+    fn test_confirm_dialog() {
+        let dialog = ConfirmDialog::cancel_task(&TaskId("test-task".to_string()));
+        assert_eq!(dialog.title, "Cancel Task");
+        assert!(dialog.message.contains("test-task"));
+        assert!(!dialog.selected); // Default to cancel for safety
+    }
+
+    #[test]
+    fn test_show_confirm() {
+        let mut state = ParallelTuiState::new();
+        state.show_confirm(ConfirmDialog::quit_with_running());
+
+        assert!(matches!(state.interaction_mode, InteractionMode::Confirm(_)));
+        if let InteractionMode::Confirm(ref dialog) = state.interaction_mode {
+            assert_eq!(dialog.title, "Quit");
+        }
+    }
+
+    #[test]
+    fn test_task_events_mode() {
+        let mut state = ParallelTuiState::new();
+        state.enter_task_events_mode();
+        assert!(matches!(state.interaction_mode, InteractionMode::TaskEvents));
+
+        state.exit_interaction_mode();
+        assert!(state.is_normal_mode());
+    }
+
+    #[test]
+    fn test_input_mode_key_handling() {
+        let mut app = ParallelTuiApp::new();
+        app.state
+            .add_workstream(test_workstream("task-1", "Test", TaskStatus::Running));
+
+        // Enter input mode
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)));
+        assert!(matches!(app.state.interaction_mode, InteractionMode::Input(_)));
+
+        // Type some text
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)));
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)));
+        if let InteractionMode::Input(ref text) = app.state.interaction_mode {
+            assert_eq!(text, "hi");
+        }
+
+        // Backspace
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)));
+        if let InteractionMode::Input(ref text) = app.state.interaction_mode {
+            assert_eq!(text, "h");
+        }
+
+        // Escape to exit
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(app.state.is_normal_mode());
+    }
+
+    #[test]
+    fn test_search_mode_key_handling() {
+        let mut app = ParallelTuiApp::new();
+        app.state
+            .add_workstream(test_workstream("task-1", "Auth feature", TaskStatus::Running));
+        app.state
+            .add_workstream(test_workstream("task-2", "API refactor", TaskStatus::Queued));
+
+        // Enter search mode
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)));
+        assert!(matches!(app.state.interaction_mode, InteractionMode::Search(_)));
+
+        // Type search query
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE)));
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE)));
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::NONE)));
+
+        // Real-time filtering
+        assert_eq!(app.state.filtered_workstreams().len(), 1);
+
+        // Enter to confirm
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(app.state.is_normal_mode());
+        assert_eq!(app.state.filter.name_filter, Some("API".to_string()));
+    }
+
+    #[test]
+    fn test_confirm_dialog_key_handling() {
+        let mut app = ParallelTuiApp::new();
+        app.state.stats.running_count = 1; // Simulate running task
+
+        // Try to quit - should show confirm
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
+        assert!(matches!(app.state.interaction_mode, InteractionMode::Confirm(_)));
+
+        // Press N to cancel
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)));
+        assert!(app.state.is_normal_mode());
+        assert!(!app.should_quit);
+
+        // Show dialog again and confirm with Y
+        app.state.show_confirm(ConfirmDialog::quit_with_running());
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)));
+        assert!(app.should_quit);
     }
 }
