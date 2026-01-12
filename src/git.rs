@@ -975,6 +975,466 @@ impl MergeCop {
     }
 }
 
+// ================================
+// MainWatcher - Proactive Rebase
+// ================================
+
+/// Configuration for MainWatcher.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MainWatcherConfig {
+    /// How often to check for updates (default: 30s).
+    #[serde(default = "default_main_watcher_interval")]
+    pub interval_secs: u64,
+
+    /// Name of the main branch to watch (default: "main").
+    #[serde(default = "default_main_branch")]
+    pub main_branch: String,
+
+    /// Enable main watching (can disable for manual-only rebases).
+    #[serde(default = "default_main_watcher_enabled")]
+    pub enabled: bool,
+
+    /// Rebase cooldown in seconds (minimum time between rebases for same task).
+    #[serde(default = "default_rebase_cooldown")]
+    pub rebase_cooldown_secs: u64,
+}
+
+fn default_main_watcher_interval() -> u64 {
+    30
+}
+fn default_main_branch() -> String {
+    "main".to_string()
+}
+fn default_main_watcher_enabled() -> bool {
+    false // Start disabled, enable after validation
+}
+fn default_rebase_cooldown() -> u64 {
+    60
+}
+
+impl Default for MainWatcherConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: default_main_watcher_interval(),
+            main_branch: default_main_branch(),
+            enabled: default_main_watcher_enabled(),
+            rebase_cooldown_secs: default_rebase_cooldown(),
+        }
+    }
+}
+
+/// Information about a main branch update.
+#[derive(Debug, Clone)]
+pub struct MainUpdate {
+    /// Path to the repository.
+    pub repo_path: PathBuf,
+    /// Previous commit hash (if known).
+    pub previous_commit: Option<String>,
+    /// New commit hash on main.
+    pub new_commit: String,
+    /// Branch name that was updated.
+    pub branch: String,
+}
+
+/// Basic commit information.
+#[derive(Debug, Clone)]
+pub struct CommitInfo {
+    /// Full commit SHA.
+    pub sha: String,
+    /// Commit message (first line).
+    pub message: String,
+}
+
+/// Result of a rebase operation.
+#[derive(Debug, Clone)]
+pub enum RebaseResult {
+    /// Rebase completed successfully.
+    Success {
+        /// Previous HEAD before rebase.
+        previous_head: String,
+        /// New HEAD after rebase.
+        new_head: String,
+    },
+    /// Rebase encountered conflicts.
+    Conflict {
+        /// Details about the conflict.
+        details: String,
+        /// Files with conflicts.
+        conflicting_files: Vec<PathBuf>,
+    },
+    /// Rebase failed (not due to conflicts).
+    Failed {
+        /// Reason for failure.
+        reason: String,
+    },
+    /// Skipped (e.g., cooldown not elapsed).
+    Skipped {
+        /// Reason for skipping.
+        reason: String,
+    },
+}
+
+/// Watches the main branch for new commits.
+pub struct MainWatcher {
+    config: MainWatcherConfig,
+    /// Last known commit on main for each tracked repo.
+    last_commits: HashMap<PathBuf, String>,
+    /// Last rebase time per task (for cooldown).
+    last_rebase_times: HashMap<TaskId, DateTime<Utc>>,
+    /// Track repos that have been fetched at least once.
+    fetched_repos: std::collections::HashSet<PathBuf>,
+}
+
+impl MainWatcher {
+    /// Create a new MainWatcher.
+    pub fn new(config: MainWatcherConfig) -> Self {
+        Self {
+            config,
+            last_commits: HashMap::new(),
+            last_rebase_times: HashMap::new(),
+            fetched_repos: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Get the configuration.
+    pub fn config(&self) -> &MainWatcherConfig {
+        &self.config
+    }
+
+    /// Clear cached state (e.g., on daemon restart).
+    pub fn clear_cache(&mut self) {
+        self.last_commits.clear();
+        self.fetched_repos.clear();
+        // Don't clear last_rebase_times - we want cooldown to persist
+    }
+
+    /// Fetch from remote if not already done for this repo.
+    async fn ensure_fetched(&mut self, repo_path: &Path) -> Result<()> {
+        let key = repo_path.to_path_buf();
+        if self.fetched_repos.contains(&key) {
+            return Ok(());
+        }
+
+        let output = Command::new("git")
+            .args(["fetch", "origin", &self.config.main_branch])
+            .current_dir(repo_path)
+            .output()
+            .await?;
+
+        if output.status.success() {
+            self.fetched_repos.insert(key);
+        }
+        // Don't fail if fetch fails - might be offline
+        Ok(())
+    }
+
+    /// Check if main has new commits in a repository.
+    pub async fn check_for_updates(&mut self, repo_path: &Path) -> Result<Option<MainUpdate>> {
+        // Ensure we've fetched at least once
+        self.ensure_fetched(repo_path).await?;
+
+        // Get current HEAD of origin/main
+        let output = Command::new("git")
+            .args(["rev-parse", &format!("origin/{}", self.config.main_branch)])
+            .current_dir(repo_path)
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            return Ok(None); // Remote might not exist yet
+        }
+
+        let current_commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        // Compare to last known
+        let repo_key = repo_path.to_path_buf();
+        if let Some(last) = self.last_commits.get(&repo_key)
+            && last == &current_commit
+        {
+            return Ok(None); // No change
+        }
+
+        // Update cached value
+        let previous = self.last_commits.insert(repo_key.clone(), current_commit.clone());
+
+        Ok(Some(MainUpdate {
+            repo_path: repo_key,
+            previous_commit: previous,
+            new_commit: current_commit,
+            branch: self.config.main_branch.clone(),
+        }))
+    }
+
+    /// Force a fetch from remote for a repository.
+    pub async fn fetch_updates(&mut self, repo_path: &Path) -> Result<bool> {
+        let output = Command::new("git")
+            .args(["fetch", "origin", &self.config.main_branch])
+            .current_dir(repo_path)
+            .output()
+            .await?;
+
+        self.fetched_repos.insert(repo_path.to_path_buf());
+        Ok(output.status.success())
+    }
+
+    /// Check if a task branch is behind main.
+    pub async fn is_behind_main(&self, repo_path: &Path, branch: &str) -> Result<bool> {
+        let main_ref = format!("origin/{}", self.config.main_branch);
+
+        // Check if main is an ancestor of branch
+        // If main is NOT an ancestor, the branch is behind (or diverged)
+        let output = Command::new("git")
+            .args(["merge-base", "--is-ancestor", &main_ref, branch])
+            .current_dir(repo_path)
+            .output()
+            .await?;
+
+        // Exit 0 = main IS ancestor = branch is up to date
+        // Exit 1 = main is NOT ancestor = branch needs rebase
+        Ok(!output.status.success())
+    }
+
+    /// Get the number of commits a branch is behind main.
+    pub async fn commits_behind(&self, repo_path: &Path, branch: &str) -> Result<usize> {
+        let main_ref = format!("origin/{}", self.config.main_branch);
+
+        let output = Command::new("git")
+            .args(["rev-list", "--count", &format!("{}..{}", branch, main_ref)])
+            .current_dir(repo_path)
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            return Ok(0);
+        }
+
+        let count_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(count_str.parse().unwrap_or(0))
+    }
+
+    /// Get list of commits on main since branch diverged.
+    pub async fn commits_since_divergence(&self, repo_path: &Path, branch: &str) -> Result<Vec<CommitInfo>> {
+        let main_ref = format!("origin/{}", self.config.main_branch);
+
+        // Find merge base
+        let base_output = Command::new("git")
+            .args(["merge-base", &main_ref, branch])
+            .current_dir(repo_path)
+            .output()
+            .await?;
+
+        if !base_output.status.success() {
+            return Ok(Vec::new());
+        }
+
+        let base = String::from_utf8_lossy(&base_output.stdout).trim().to_string();
+
+        // Get commits from base to main
+        let log_output = Command::new("git")
+            .args(["log", "--oneline", "--format=%H|%s", &format!("{}..{}", base, main_ref)])
+            .current_dir(repo_path)
+            .output()
+            .await?;
+
+        let commits = String::from_utf8_lossy(&log_output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.splitn(2, '|').collect();
+                if parts.len() == 2 {
+                    Some(CommitInfo {
+                        sha: parts[0].to_string(),
+                        message: parts[1].to_string(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        Ok(commits)
+    }
+
+    /// Check if cooldown has elapsed for a task.
+    pub fn cooldown_elapsed(&self, task_id: &TaskId) -> bool {
+        if let Some(last_time) = self.last_rebase_times.get(task_id) {
+            let elapsed = Utc::now().signed_duration_since(*last_time);
+            elapsed.num_seconds() >= self.config.rebase_cooldown_secs as i64
+        } else {
+            true // No previous rebase, cooldown elapsed
+        }
+    }
+
+    /// Record that a task was rebased.
+    pub fn record_rebase(&mut self, task_id: &TaskId) {
+        self.last_rebase_times.insert(task_id.clone(), Utc::now());
+    }
+
+    /// Perform a rebase of a worktree against main.
+    ///
+    /// This handles:
+    /// 1. Checking cooldown
+    /// 2. Stashing uncommitted changes
+    /// 3. Fetching latest
+    /// 4. Rebasing
+    /// 5. Unstashing changes
+    /// 6. Aborting if conflicts occur
+    pub async fn perform_rebase(&mut self, task_id: &TaskId, worktree_path: &Path) -> Result<RebaseResult> {
+        // Check cooldown
+        if !self.cooldown_elapsed(task_id) {
+            return Ok(RebaseResult::Skipped {
+                reason: "Cooldown not elapsed".to_string(),
+            });
+        }
+
+        // Get current HEAD before rebase
+        let head_before = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(worktree_path)
+            .output()
+            .await?;
+
+        let previous_head = String::from_utf8_lossy(&head_before.stdout).trim().to_string();
+
+        // Check for uncommitted changes and stash if needed
+        let status = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(worktree_path)
+            .output()
+            .await?;
+
+        let has_changes = !String::from_utf8_lossy(&status.stdout).trim().is_empty();
+        let mut stashed = false;
+
+        if has_changes {
+            let stash = Command::new("git")
+                .args(["stash", "push", "-m", "neuraphage-rebase-autostash"])
+                .current_dir(worktree_path)
+                .output()
+                .await?;
+
+            stashed = stash.status.success();
+        }
+
+        // Fetch latest
+        let fetch = Command::new("git")
+            .args(["fetch", "origin", &self.config.main_branch])
+            .current_dir(worktree_path)
+            .output()
+            .await?;
+
+        if !fetch.status.success() {
+            // Unstash if we stashed
+            if stashed {
+                let _ = Command::new("git")
+                    .args(["stash", "pop"])
+                    .current_dir(worktree_path)
+                    .output()
+                    .await;
+            }
+            return Ok(RebaseResult::Failed {
+                reason: format!("Failed to fetch origin/{}", self.config.main_branch),
+            });
+        }
+
+        // Attempt rebase
+        let main_ref = format!("origin/{}", self.config.main_branch);
+        let rebase = Command::new("git")
+            .args(["rebase", &main_ref])
+            .current_dir(worktree_path)
+            .output()
+            .await?;
+
+        if rebase.status.success() {
+            // Get new HEAD
+            let head_after = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(worktree_path)
+                .output()
+                .await?;
+
+            let new_head = String::from_utf8_lossy(&head_after.stdout).trim().to_string();
+
+            // Unstash if we stashed
+            if stashed {
+                let _ = Command::new("git")
+                    .args(["stash", "pop"])
+                    .current_dir(worktree_path)
+                    .output()
+                    .await;
+            }
+
+            // Record successful rebase
+            self.record_rebase(task_id);
+
+            return Ok(RebaseResult::Success {
+                previous_head,
+                new_head,
+            });
+        }
+
+        // Rebase failed - likely conflicts
+        let stderr = String::from_utf8_lossy(&rebase.stderr);
+
+        // Get conflicting files
+        let diff_output = Command::new("git")
+            .args(["diff", "--name-only", "--diff-filter=U"])
+            .current_dir(worktree_path)
+            .output()
+            .await?;
+
+        let conflicting_files: Vec<PathBuf> = String::from_utf8_lossy(&diff_output.stdout)
+            .lines()
+            .map(PathBuf::from)
+            .collect();
+
+        // Abort the failed rebase
+        let _ = Command::new("git")
+            .args(["rebase", "--abort"])
+            .current_dir(worktree_path)
+            .output()
+            .await;
+
+        // Unstash if we stashed
+        if stashed {
+            let _ = Command::new("git")
+                .args(["stash", "pop"])
+                .current_dir(worktree_path)
+                .output()
+                .await;
+        }
+
+        Ok(RebaseResult::Conflict {
+            details: stderr.to_string(),
+            conflicting_files,
+        })
+    }
+
+    /// Get rebase status for a task.
+    pub async fn get_rebase_status(&self, task_id: &TaskId, worktree: &WorktreeInfo) -> Result<TaskRebaseStatus> {
+        let behind = self.commits_behind(&worktree.repo_path, &worktree.branch).await?;
+
+        Ok(TaskRebaseStatus {
+            task_id: task_id.0.clone(),
+            branch: worktree.branch.clone(),
+            commits_behind: behind,
+            last_rebased: self.last_rebase_times.get(task_id).copied(),
+        })
+    }
+}
+
+/// Rebase status for a task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRebaseStatus {
+    /// Task ID.
+    pub task_id: String,
+    /// Branch name.
+    pub branch: String,
+    /// Number of commits behind main.
+    pub commits_behind: usize,
+    /// Last successful rebase time.
+    pub last_rebased: Option<DateTime<Utc>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1342,5 +1802,186 @@ mod tests {
         assert!(prompt.contains("our code"));
         assert!(prompt.contains("their code"));
         assert!(prompt.contains("Content"));
+    }
+
+    // MainWatcher tests
+
+    #[test]
+    fn test_main_watcher_config_default() {
+        let config = MainWatcherConfig::default();
+        assert_eq!(config.interval_secs, 30);
+        assert_eq!(config.main_branch, "main");
+        assert!(!config.enabled); // Disabled by default
+        assert_eq!(config.rebase_cooldown_secs, 60);
+    }
+
+    #[test]
+    fn test_main_watcher_new() {
+        let config = MainWatcherConfig::default();
+        let watcher = MainWatcher::new(config.clone());
+        assert_eq!(watcher.config().interval_secs, config.interval_secs);
+        assert_eq!(watcher.config().main_branch, config.main_branch);
+    }
+
+    #[test]
+    fn test_main_watcher_cooldown() {
+        let config = MainWatcherConfig {
+            rebase_cooldown_secs: 60,
+            ..Default::default()
+        };
+        let mut watcher = MainWatcher::new(config);
+        let task_id = TaskId("test-cooldown".to_string());
+
+        // Initially cooldown is elapsed (no previous rebase)
+        assert!(watcher.cooldown_elapsed(&task_id));
+
+        // Record a rebase
+        watcher.record_rebase(&task_id);
+
+        // Cooldown not elapsed (just rebased)
+        assert!(!watcher.cooldown_elapsed(&task_id));
+
+        // Manually set to past time
+        let past = Utc::now() - chrono::Duration::seconds(120);
+        watcher.last_rebase_times.insert(task_id.clone(), past);
+
+        // Cooldown should now be elapsed
+        assert!(watcher.cooldown_elapsed(&task_id));
+    }
+
+    #[test]
+    fn test_main_watcher_clear_cache() {
+        let config = MainWatcherConfig::default();
+        let mut watcher = MainWatcher::new(config);
+
+        // Add some cached data
+        watcher
+            .last_commits
+            .insert(PathBuf::from("/tmp/repo1"), "abc123".to_string());
+        watcher.fetched_repos.insert(PathBuf::from("/tmp/repo1"));
+
+        let task_id = TaskId("test".to_string());
+        watcher.record_rebase(&task_id);
+
+        // Clear cache
+        watcher.clear_cache();
+
+        // Commits and fetched repos should be cleared
+        assert!(watcher.last_commits.is_empty());
+        assert!(watcher.fetched_repos.is_empty());
+
+        // But rebase times should persist
+        assert!(watcher.last_rebase_times.contains_key(&task_id));
+    }
+
+    #[tokio::test]
+    async fn test_main_watcher_check_for_updates() {
+        let temp = TempDir::new().unwrap();
+        let repo_path = temp.path().join("repo");
+
+        std::fs::create_dir_all(&repo_path).unwrap();
+
+        if !init_git_repo(&repo_path) || !create_initial_commit(&repo_path) {
+            return; // Skip if git not available
+        }
+
+        let config = MainWatcherConfig::default();
+        let mut watcher = MainWatcher::new(config);
+
+        // First check should return None (no origin/main yet - local repo only)
+        let result = watcher.check_for_updates(&repo_path).await;
+        // This will likely return None since there's no remote
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_main_watcher_is_behind_main() {
+        let temp = TempDir::new().unwrap();
+        let repo_path = temp.path().join("repo");
+
+        std::fs::create_dir_all(&repo_path).unwrap();
+
+        if !init_git_repo(&repo_path) || !create_initial_commit(&repo_path) {
+            return;
+        }
+
+        let config = MainWatcherConfig {
+            main_branch: "main".to_string(),
+            ..Default::default()
+        };
+        let watcher = MainWatcher::new(config);
+
+        // Without a remote, this will return an error or false
+        // The important thing is it doesn't crash
+        let _result = watcher.is_behind_main(&repo_path, "main").await;
+    }
+
+    #[test]
+    fn test_task_rebase_status() {
+        let status = TaskRebaseStatus {
+            task_id: "task-123".to_string(),
+            branch: "neuraphage/task-123".to_string(),
+            commits_behind: 3,
+            last_rebased: Some(Utc::now()),
+        };
+
+        assert_eq!(status.task_id, "task-123");
+        assert_eq!(status.commits_behind, 3);
+        assert!(status.last_rebased.is_some());
+    }
+
+    #[test]
+    fn test_rebase_result_variants() {
+        // Success
+        let success = RebaseResult::Success {
+            previous_head: "abc123".to_string(),
+            new_head: "def456".to_string(),
+        };
+        assert!(matches!(success, RebaseResult::Success { .. }));
+
+        // Conflict
+        let conflict = RebaseResult::Conflict {
+            details: "CONFLICT in foo.rs".to_string(),
+            conflicting_files: vec![PathBuf::from("foo.rs")],
+        };
+        assert!(matches!(conflict, RebaseResult::Conflict { .. }));
+
+        // Failed
+        let failed = RebaseResult::Failed {
+            reason: "Network error".to_string(),
+        };
+        assert!(matches!(failed, RebaseResult::Failed { .. }));
+
+        // Skipped
+        let skipped = RebaseResult::Skipped {
+            reason: "Cooldown not elapsed".to_string(),
+        };
+        assert!(matches!(skipped, RebaseResult::Skipped { .. }));
+    }
+
+    #[test]
+    fn test_main_update() {
+        let update = MainUpdate {
+            repo_path: PathBuf::from("/tmp/repo"),
+            previous_commit: Some("abc123".to_string()),
+            new_commit: "def456".to_string(),
+            branch: "main".to_string(),
+        };
+
+        assert_eq!(update.repo_path, PathBuf::from("/tmp/repo"));
+        assert_eq!(update.previous_commit, Some("abc123".to_string()));
+        assert_eq!(update.new_commit, "def456");
+        assert_eq!(update.branch, "main");
+    }
+
+    #[test]
+    fn test_commit_info() {
+        let info = CommitInfo {
+            sha: "abc123def456".to_string(),
+            message: "feat: add new feature".to_string(),
+        };
+
+        assert_eq!(info.sha, "abc123def456");
+        assert_eq!(info.message, "feat: add new feature");
     }
 }

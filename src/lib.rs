@@ -65,6 +65,8 @@ pub use git::{
     ConflictInfo, ConflictType, GitCoordinator, MergeCop, MergeCopConfig, MergeDecision, MergeQueue, MergeRequest,
     MergeResult, ReconcileResult, ResolutionContext, ResolutionResult, WorktreeInfo, WorktreeRegistry,
 };
+// Re-export MainWatcher types for proactive rebase
+pub use git::{CommitInfo, MainUpdate, MainWatcher, MainWatcherConfig, RebaseResult, TaskRebaseStatus};
 
 // Re-export supervised executor types
 pub use supervised::{
