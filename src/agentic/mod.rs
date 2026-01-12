@@ -107,19 +107,22 @@ impl<L: LlmClient> AgenticLoop<L> {
         })
     }
 
-    /// Load an existing conversation.
+    /// Load an existing conversation with execution state restored.
     pub fn load(config: AgenticConfig, llm: L, event_tx: Option<mpsc::Sender<ExecutionEvent>>) -> Result<Self> {
         let conversation = Conversation::load(&config.conversation_path)?;
         let tools = ToolExecutor::new(config.working_dir.clone());
+
+        // Restore execution state from conversation
+        let state = &conversation.execution_state;
 
         Ok(Self {
             config,
             llm,
             tools,
+            iteration: state.iteration,     // RESTORED (was: 0)
+            tokens_used: state.tokens_used, // RESTORED (was: 0)
+            cost: state.cost,               // RESTORED (was: 0)
             conversation,
-            iteration: 0,
-            tokens_used: 0,
-            cost: 0.0,
             event_tx,
         })
     }
@@ -382,9 +385,34 @@ impl<L: LlmClient> AgenticLoop<L> {
         prompt_builder.build(task)
     }
 
-    /// Save the conversation.
-    pub fn save(&self) -> Result<()> {
+    /// Save the conversation with current execution state.
+    pub fn save(&mut self) -> Result<()> {
+        // Update execution state before saving
+        self.conversation.execution_state.iteration = self.iteration;
+        self.conversation.execution_state.tokens_used = self.tokens_used;
+        self.conversation.execution_state.cost = self.cost;
+        self.conversation.execution_state.saved_at = Some(chrono::Utc::now());
         self.conversation.save()
+    }
+
+    /// Set a checkpoint marker for crash recovery.
+    ///
+    /// This marks the current phase of execution so recovery knows where
+    /// to resume. The checkpoint is saved immediately.
+    pub fn set_checkpoint(&mut self, marker: CheckpointMarker) -> Result<()> {
+        self.conversation.execution_state.checkpoint = Some(marker);
+        self.save()
+    }
+
+    /// Clear the checkpoint marker (e.g., after successful completion).
+    pub fn clear_checkpoint(&mut self) -> Result<()> {
+        self.conversation.execution_state.checkpoint = None;
+        self.save()
+    }
+
+    /// Get the current checkpoint marker, if any.
+    pub fn checkpoint(&self) -> Option<&CheckpointMarker> {
+        self.conversation.execution_state.checkpoint.as_ref()
     }
 
     /// Inject a system message into the conversation.
@@ -580,5 +608,150 @@ mod tests {
             .find(|m| m.role == MessageRole::Assistant)
             .expect("Should have assistant message");
         assert_eq!(assistant_msg.content, "Response to be saved");
+    }
+
+    #[tokio::test]
+    async fn test_agentic_loop_recovery_preserves_counters() {
+        let temp_dir = TempDir::new().unwrap();
+        let conv_path = temp_dir.path().join("recovery_conv");
+
+        // First run - execute some iterations and save
+        {
+            let mock_llm = MockLlmClient::new(vec![
+                LlmResponse {
+                    content: "Response 1".to_string(),
+                    tool_calls: vec![],
+                    stop_reason: Some("end_turn".to_string()),
+                    tokens_used: 100,
+                    cost: 0.01,
+                },
+                LlmResponse {
+                    content: "Response 2".to_string(),
+                    tool_calls: vec![],
+                    stop_reason: Some("end_turn".to_string()),
+                    tokens_used: 150,
+                    cost: 0.015,
+                },
+            ]);
+
+            let config = AgenticConfig {
+                max_iterations: 100,
+                max_tokens: 10000,
+                max_cost: 10.0,
+                model: "test-model".to_string(),
+                working_dir: temp_dir.path().to_path_buf(),
+                conversation_path: conv_path.clone(),
+            };
+
+            let mut loop1 = AgenticLoop::new(config.clone(), mock_llm, None).unwrap();
+            loop1.add_user_message("Test").unwrap();
+
+            let task = make_test_task("test-recovery-1");
+            let _ = loop1.iterate(&task).await; // iteration 1, tokens=100, cost=0.01
+            loop1.add_user_message("Continue").unwrap();
+            let _ = loop1.iterate(&task).await; // iteration 2, tokens=250, cost=0.025
+            loop1.save().unwrap();
+
+            assert_eq!(loop1.iteration(), 2);
+            assert_eq!(loop1.tokens_used(), 250);
+            assert!((loop1.cost() - 0.025).abs() < 0.001);
+        }
+
+        // Simulate crash - scope ended, loop dropped
+
+        // Second run - load and verify counters restored
+        {
+            let mock_llm = MockLlmClient::new(vec![LlmResponse {
+                content: "Response 3".to_string(),
+                tool_calls: vec![],
+                stop_reason: Some("end_turn".to_string()),
+                tokens_used: 50,
+                cost: 0.005,
+            }]);
+
+            let config = AgenticConfig {
+                max_iterations: 100,
+                max_tokens: 10000,
+                max_cost: 10.0,
+                model: "test-model".to_string(),
+                working_dir: temp_dir.path().to_path_buf(),
+                conversation_path: conv_path.clone(),
+            };
+
+            let mut loop2 = AgenticLoop::load(config, mock_llm, None).unwrap();
+
+            // Counters should be restored
+            assert_eq!(loop2.iteration(), 2, "iteration should be restored");
+            assert_eq!(loop2.tokens_used(), 250, "tokens_used should be restored");
+            assert!((loop2.cost() - 0.025).abs() < 0.001, "cost should be restored");
+
+            // Continue execution
+            let task = make_test_task("test-recovery-1");
+            loop2.add_user_message("More").unwrap();
+            let _ = loop2.iterate(&task).await; // iteration 3
+
+            assert_eq!(loop2.iteration(), 3);
+            assert_eq!(loop2.tokens_used(), 300);
+            assert!((loop2.cost() - 0.030).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn test_set_checkpoint() {
+        let temp_dir = TempDir::new().unwrap();
+        let conv_path = temp_dir.path().join("checkpoint_conv");
+
+        let mock_llm = MockLlmClient::new(vec![]);
+        let config = AgenticConfig {
+            max_iterations: 100,
+            max_tokens: 10000,
+            max_cost: 10.0,
+            model: "test-model".to_string(),
+            working_dir: temp_dir.path().to_path_buf(),
+            conversation_path: conv_path.clone(),
+        };
+
+        let mut agentic_loop = AgenticLoop::new(config.clone(), mock_llm, None).unwrap();
+
+        // Set a checkpoint
+        agentic_loop
+            .set_checkpoint(CheckpointMarker::ToolStarted {
+                tool_name: "bash".to_string(),
+                tool_use_id: "tu_test".to_string(),
+                params_hash: "hash123".to_string(),
+            })
+            .unwrap();
+
+        // Verify checkpoint is set
+        assert!(matches!(
+            agentic_loop.checkpoint(),
+            Some(CheckpointMarker::ToolStarted { tool_name, .. }) if tool_name == "bash"
+        ));
+
+        // Reload and verify checkpoint persisted
+        let mock_llm2 = MockLlmClient::new(vec![]);
+        let loop2 = AgenticLoop::load(config, mock_llm2, None).unwrap();
+        assert!(matches!(
+            loop2.checkpoint(),
+            Some(CheckpointMarker::ToolStarted { tool_name, .. }) if tool_name == "bash"
+        ));
+
+        // Clear checkpoint
+        let mock_llm3 = MockLlmClient::new(vec![]);
+        let mut loop3 = AgenticLoop::load(
+            AgenticConfig {
+                max_iterations: 100,
+                max_tokens: 10000,
+                max_cost: 10.0,
+                model: "test-model".to_string(),
+                working_dir: temp_dir.path().to_path_buf(),
+                conversation_path: conv_path.clone(),
+            },
+            mock_llm3,
+            None,
+        )
+        .unwrap();
+        loop3.clear_checkpoint().unwrap();
+        assert!(loop3.checkpoint().is_none());
     }
 }
