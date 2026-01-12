@@ -446,6 +446,333 @@ impl GitCoordinator {
     pub fn worktree_base(&self) -> &Path {
         &self.worktree_base
     }
+
+    /// Check if a branch can be fast-forwarded to another.
+    pub async fn can_fast_forward(&self, repo_path: &Path, from: &str, to: &str) -> Result<bool> {
+        // A fast-forward is possible if `from` is an ancestor of `to`
+        let output = Command::new("git")
+            .args(["merge-base", "--is-ancestor", from, to])
+            .current_dir(repo_path)
+            .output()
+            .await?;
+
+        Ok(output.status.success())
+    }
+
+    /// Detect merge conflicts without actually merging.
+    /// Uses git merge-tree to simulate the merge.
+    pub async fn detect_conflicts(&self, repo_path: &Path, branch: &str, target: &str) -> Result<Vec<ConflictInfo>> {
+        // Use git merge-tree to detect conflicts without modifying worktree
+        let output = Command::new("git")
+            .args(["merge-tree", "--write-tree", target, branch])
+            .current_dir(repo_path)
+            .output()
+            .await?;
+
+        if output.status.success() {
+            return Ok(Vec::new()); // No conflicts
+        }
+
+        // Parse conflict information from stderr
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Ok(Self::parse_conflicts(&stderr))
+    }
+
+    /// Parse git merge-tree output for conflict details.
+    fn parse_conflicts(output: &str) -> Vec<ConflictInfo> {
+        let mut conflicts = Vec::new();
+        for line in output.lines() {
+            if line.starts_with("CONFLICT") {
+                // Extract file and type from conflict line
+                // Format: "CONFLICT (content): Merge conflict in <file>"
+                let conflict_type = if line.contains("(content)") {
+                    ConflictType::Content
+                } else if line.contains("(modify/delete)") {
+                    ConflictType::DeleteModify
+                } else if line.contains("(add/add)") {
+                    ConflictType::AddAdd
+                } else if line.contains("(rename/rename)") {
+                    ConflictType::RenameRename
+                } else {
+                    ConflictType::Content
+                };
+
+                if let Some(file) = line.split("Merge conflict in ").nth(1) {
+                    conflicts.push(ConflictInfo {
+                        file: PathBuf::from(file.trim()),
+                        conflict_type,
+                    });
+                }
+            }
+        }
+        conflicts
+    }
+}
+
+/// Information about a merge conflict.
+#[derive(Debug, Clone)]
+pub struct ConflictInfo {
+    /// The file with conflicts
+    pub file: PathBuf,
+    /// Type of conflict
+    pub conflict_type: ConflictType,
+}
+
+/// Type of merge conflict.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConflictType {
+    /// Both modified same lines
+    Content,
+    /// One deleted, one modified
+    DeleteModify,
+    /// Both added same file
+    AddAdd,
+    /// Renamed to different names
+    RenameRename,
+}
+
+/// A request to merge a task branch.
+#[derive(Debug, Clone)]
+pub struct MergeRequest {
+    /// Task that produced the branch
+    pub task_id: TaskId,
+    /// Branch to merge
+    pub branch: String,
+    /// Target branch (usually main)
+    pub target: String,
+    /// Path to the repository
+    pub repo_path: PathBuf,
+    /// When the task completed
+    pub completed_at: DateTime<Utc>,
+}
+
+/// Result of a merge operation.
+#[derive(Debug)]
+pub enum MergeResult {
+    /// Merge completed successfully
+    Success { task_id: TaskId },
+    /// Merge had conflicts that need resolution
+    Conflict {
+        task_id: TaskId,
+        conflicts: Vec<ConflictInfo>,
+    },
+    /// Merge was escalated to user
+    Escalated { task_id: TaskId, reason: String },
+}
+
+/// Queue for managing branch merges.
+#[derive(Debug, Default)]
+pub struct MergeQueue {
+    /// Tasks ready to merge, ordered by completion time
+    pending: std::collections::VecDeque<MergeRequest>,
+    /// Currently merging task
+    active: Option<MergeRequest>,
+}
+
+impl MergeQueue {
+    /// Create a new merge queue.
+    pub fn new() -> Self {
+        Self {
+            pending: std::collections::VecDeque::new(),
+            active: None,
+        }
+    }
+
+    /// Add a completed task to the merge queue.
+    pub fn enqueue(&mut self, request: MergeRequest) {
+        self.pending.push_back(request);
+    }
+
+    /// Get the next request without removing it.
+    pub fn peek(&self) -> Option<&MergeRequest> {
+        if self.active.is_some() {
+            None // Already processing
+        } else {
+            self.pending.front()
+        }
+    }
+
+    /// Remove and return the next request.
+    pub fn pop(&mut self) -> Option<MergeRequest> {
+        self.active.take();
+        self.pending.pop_front()
+    }
+
+    /// Mark a request as active (being processed).
+    pub fn set_active(&mut self, request: MergeRequest) {
+        self.active = Some(request);
+    }
+
+    /// Get the currently active request.
+    pub fn active(&self) -> Option<&MergeRequest> {
+        self.active.as_ref()
+    }
+
+    /// Check if the queue is empty.
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty() && self.active.is_none()
+    }
+
+    /// Get the number of pending merges.
+    pub fn len(&self) -> usize {
+        self.pending.len() + if self.active.is_some() { 1 } else { 0 }
+    }
+}
+
+/// Configuration for MergeCop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeCopConfig {
+    /// How often to check queue (in seconds)
+    #[serde(default = "default_interval")]
+    pub interval_secs: u64,
+
+    /// Auto-merge clean fast-forwards without AI
+    #[serde(default = "default_auto_merge")]
+    pub auto_merge_clean: bool,
+
+    /// Max retries before escalating to user
+    #[serde(default = "default_max_retries")]
+    pub max_conflict_retries: usize,
+
+    /// Enable MergeCop (can disable for manual-only merges)
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_interval() -> u64 {
+    60
+}
+fn default_auto_merge() -> bool {
+    true
+}
+fn default_max_retries() -> usize {
+    2
+}
+fn default_enabled() -> bool {
+    true
+}
+
+impl Default for MergeCopConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: default_interval(),
+            auto_merge_clean: default_auto_merge(),
+            max_conflict_retries: default_max_retries(),
+            enabled: default_enabled(),
+        }
+    }
+}
+
+/// Decision on how to handle a merge.
+#[derive(Debug)]
+pub enum MergeDecision {
+    /// Clean merge, no AI needed
+    AutoMerge,
+    /// Conflicts detected, needs resolution
+    NeedsResolution { conflicts: Vec<ConflictInfo> },
+    /// Cannot merge, escalate to user
+    Escalate { reason: String },
+}
+
+/// MergeCop handles intelligent merge decisions.
+/// Uses GC pattern for clean cases, escalates conflicts.
+pub struct MergeCop {
+    config: MergeCopConfig,
+}
+
+impl MergeCop {
+    /// Create a new MergeCop.
+    pub fn new(config: MergeCopConfig) -> Self {
+        Self { config }
+    }
+
+    /// Get the configuration.
+    pub fn config(&self) -> &MergeCopConfig {
+        &self.config
+    }
+
+    /// Evaluate a merge request and decide how to handle it.
+    pub async fn evaluate(&self, request: &MergeRequest, git: &GitCoordinator) -> Result<MergeDecision> {
+        // 1. Check if fast-forward possible (target is ancestor of branch)
+        if git
+            .can_fast_forward(&request.repo_path, &request.target, &request.branch)
+            .await?
+        {
+            return Ok(MergeDecision::AutoMerge);
+        }
+
+        // 2. Try to detect conflicts without actually merging
+        let conflicts = git
+            .detect_conflicts(&request.repo_path, &request.branch, &request.target)
+            .await?;
+
+        if conflicts.is_empty() {
+            // Clean merge commit (no fast-forward but no conflicts)
+            return Ok(MergeDecision::AutoMerge);
+        }
+
+        // 3. Conflicts exist - in basic MergeCop, we escalate
+        // Smart MergeCop (Phase 4) will add AI resolution here
+        Ok(MergeDecision::NeedsResolution { conflicts })
+    }
+
+    /// Process the merge queue.
+    /// Returns results for any completed merges.
+    pub async fn process_queue(&self, queue: &mut MergeQueue, git: &GitCoordinator) -> Result<Vec<MergeResult>> {
+        if !self.config.enabled {
+            return Ok(Vec::new());
+        }
+
+        let mut results = Vec::new();
+
+        while let Some(request) = queue.peek().cloned() {
+            queue.set_active(request.clone());
+
+            let decision = self.evaluate(&request, git).await?;
+
+            match decision {
+                MergeDecision::AutoMerge => {
+                    // Perform the merge
+                    match git
+                        .merge_branch(&request.repo_path, &request.branch, &request.target)
+                        .await
+                    {
+                        Ok(()) => {
+                            results.push(MergeResult::Success {
+                                task_id: request.task_id.clone(),
+                            });
+                        }
+                        Err(e) => {
+                            // Merge failed unexpectedly - escalate
+                            results.push(MergeResult::Escalated {
+                                task_id: request.task_id.clone(),
+                                reason: e.to_string(),
+                            });
+                        }
+                    }
+                    queue.pop();
+                }
+                MergeDecision::NeedsResolution { conflicts } => {
+                    // In basic MergeCop, we just report the conflict
+                    // Smart MergeCop will attempt AI resolution
+                    results.push(MergeResult::Conflict {
+                        task_id: request.task_id.clone(),
+                        conflicts,
+                    });
+                    queue.pop();
+                }
+                MergeDecision::Escalate { reason } => {
+                    results.push(MergeResult::Escalated {
+                        task_id: request.task_id.clone(),
+                        reason,
+                    });
+                    queue.pop();
+                }
+            }
+        }
+
+        Ok(results)
+    }
 }
 
 #[cfg(test)]
@@ -658,5 +985,112 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert_eq!(paths[0], PathBuf::from("/home/user/repo"));
         assert_eq!(paths[1], PathBuf::from("/home/user/.worktrees/task-1"));
+    }
+
+    #[test]
+    fn test_merge_queue_basic() {
+        let mut queue = MergeQueue::new();
+        assert!(queue.is_empty());
+        assert_eq!(queue.len(), 0);
+
+        // Enqueue a request
+        let request = MergeRequest {
+            task_id: TaskId("task-1".to_string()),
+            branch: "neuraphage/task-1".to_string(),
+            target: "main".to_string(),
+            repo_path: PathBuf::from("/tmp/repo"),
+            completed_at: Utc::now(),
+        };
+        queue.enqueue(request);
+
+        assert!(!queue.is_empty());
+        assert_eq!(queue.len(), 1);
+        assert!(queue.peek().is_some());
+        assert_eq!(queue.peek().unwrap().task_id.0, "task-1");
+
+        // Pop the request
+        let popped = queue.pop();
+        assert!(popped.is_some());
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_merge_queue_ordering() {
+        let mut queue = MergeQueue::new();
+
+        // Enqueue multiple requests
+        for i in 1..=3 {
+            queue.enqueue(MergeRequest {
+                task_id: TaskId(format!("task-{}", i)),
+                branch: format!("neuraphage/task-{}", i),
+                target: "main".to_string(),
+                repo_path: PathBuf::from("/tmp/repo"),
+                completed_at: Utc::now(),
+            });
+        }
+
+        assert_eq!(queue.len(), 3);
+
+        // FIFO order
+        assert_eq!(queue.pop().unwrap().task_id.0, "task-1");
+        assert_eq!(queue.pop().unwrap().task_id.0, "task-2");
+        assert_eq!(queue.pop().unwrap().task_id.0, "task-3");
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_merge_queue_active() {
+        let mut queue = MergeQueue::new();
+
+        let request = MergeRequest {
+            task_id: TaskId("task-1".to_string()),
+            branch: "neuraphage/task-1".to_string(),
+            target: "main".to_string(),
+            repo_path: PathBuf::from("/tmp/repo"),
+            completed_at: Utc::now(),
+        };
+        queue.enqueue(request.clone());
+
+        // Set active
+        queue.set_active(request);
+        assert!(queue.active().is_some());
+
+        // Peek returns None when active is set
+        assert!(queue.peek().is_none());
+
+        // Pop clears active
+        queue.pop();
+        assert!(queue.active().is_none());
+    }
+
+    #[test]
+    fn test_mergecop_config_default() {
+        let config = MergeCopConfig::default();
+        assert_eq!(config.interval_secs, 60);
+        assert!(config.auto_merge_clean);
+        assert_eq!(config.max_conflict_retries, 2);
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn test_parse_conflicts() {
+        // Only lines with "Merge conflict in" are parsed
+        let output =
+            "CONFLICT (content): Merge conflict in src/main.rs\nCONFLICT (add/add): Merge conflict in src/new.rs\n";
+
+        let conflicts = GitCoordinator::parse_conflicts(output);
+        assert_eq!(conflicts.len(), 2);
+
+        assert_eq!(conflicts[0].file, PathBuf::from("src/main.rs"));
+        assert_eq!(conflicts[0].conflict_type, ConflictType::Content);
+
+        assert_eq!(conflicts[1].file, PathBuf::from("src/new.rs"));
+        assert_eq!(conflicts[1].conflict_type, ConflictType::AddAdd);
+    }
+
+    #[test]
+    fn test_conflict_type_equality() {
+        assert_eq!(ConflictType::Content, ConflictType::Content);
+        assert_ne!(ConflictType::Content, ConflictType::DeleteModify);
     }
 }

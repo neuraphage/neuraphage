@@ -56,4 +56,7 @@ pub use safety::{SafetyCheckResult, SafetyChecker, SafetyConfig};
 pub use sandbox::{SandboxAvailability, SandboxConfig, SandboxMode};
 
 // Re-export git types
-pub use git::{GitCoordinator, ReconcileResult, WorktreeInfo, WorktreeRegistry};
+pub use git::{
+    ConflictInfo, ConflictType, GitCoordinator, MergeCop, MergeCopConfig, MergeDecision, MergeQueue, MergeRequest,
+    MergeResult, ReconcileResult, WorktreeInfo, WorktreeRegistry,
+};
