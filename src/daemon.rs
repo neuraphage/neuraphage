@@ -8,9 +8,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
+use crate::coordination::EventBus;
 use crate::error::{Error, Result};
-use crate::executor::{Activity, ExecutionEvent, ExecutionStatus, ExecutorConfig, TaskExecutor};
+use crate::executor::{Activity, ExecutionEvent, ExecutionStatus, ExecutorConfig};
 use crate::git::{MergeQueue, MergeRequest, WorktreeInfo};
+use crate::supervised::{SupervisedExecutor, SupervisedExecutorConfig};
 use crate::task::{Task, TaskId, TaskStatus};
 use crate::task_manager::TaskManager;
 
@@ -50,6 +52,13 @@ pub struct DaemonConfig {
     pub pid_path: PathBuf,
     /// Path to the data directory (for engram store).
     pub data_path: PathBuf,
+    /// Enable supervised execution with Watcher and Syncer.
+    #[serde(default = "default_supervision_enabled")]
+    pub supervision_enabled: bool,
+}
+
+fn default_supervision_enabled() -> bool {
+    true
 }
 
 impl Default for DaemonConfig {
@@ -62,6 +71,7 @@ impl Default for DaemonConfig {
             socket_path: base.join("neuraphage.sock"),
             pid_path: base.join("neuraphage.pid"),
             data_path: base.clone(),
+            supervision_enabled: true,
         }
     }
 }
@@ -73,6 +83,7 @@ impl DaemonConfig {
             socket_path: path.join("neuraphage.sock"),
             pid_path: path.join("neuraphage.pid"),
             data_path: path.to_path_buf(),
+            supervision_enabled: true,
         }
     }
 }
@@ -322,7 +333,9 @@ impl From<&ExecutionStatus> for ExecutionStatusDto {
 pub struct Daemon {
     config: DaemonConfig,
     manager: Arc<Mutex<TaskManager>>,
-    executor: Arc<Mutex<TaskExecutor>>,
+    supervised_executor: Arc<SupervisedExecutor>,
+    #[allow(dead_code)]
+    event_bus: Arc<EventBus>,
     merge_queue: Arc<Mutex<MergeQueue>>,
     shutdown: tokio::sync::broadcast::Sender<()>,
 }
@@ -340,12 +353,19 @@ impl Daemon {
             TaskManager::init(&config.data_path)?
         };
 
-        // Initialize task executor
-        let executor_config = ExecutorConfig {
-            data_dir: config.data_path.clone(),
+        // Initialize event bus
+        let event_bus = Arc::new(EventBus::new());
+
+        // Initialize supervised executor
+        let supervised_config = SupervisedExecutorConfig {
+            executor: ExecutorConfig {
+                data_dir: config.data_path.clone(),
+                ..Default::default()
+            },
+            supervision_enabled: config.supervision_enabled,
             ..Default::default()
         };
-        let executor = TaskExecutor::new(executor_config)?;
+        let supervised_executor = Arc::new(SupervisedExecutor::new(supervised_config, Arc::clone(&event_bus))?);
 
         // Initialize merge queue
         let merge_queue = MergeQueue::new();
@@ -355,7 +375,8 @@ impl Daemon {
         Ok(Self {
             config,
             manager: Arc::new(Mutex::new(manager)),
-            executor: Arc::new(Mutex::new(executor)),
+            supervised_executor,
+            event_bus,
             merge_queue: Arc::new(Mutex::new(merge_queue)),
             shutdown,
         })
@@ -371,6 +392,20 @@ impl Daemon {
         // Write PID file
         std::fs::write(&self.config.pid_path, std::process::id().to_string())?;
 
+        // Spawn supervision loops if enabled
+        let _watcher_handle = if self.config.supervision_enabled {
+            log::info!("Starting supervision loops (watcher + syncer)");
+            Some(self.supervised_executor.spawn_watcher_loop())
+        } else {
+            None
+        };
+
+        let _syncer_handle = if self.config.supervision_enabled {
+            Some(self.supervised_executor.spawn_syncer_loop())
+        } else {
+            None
+        };
+
         // Bind to socket
         let listener = UnixListener::bind(&self.config.socket_path)?;
         log::info!("Daemon listening on {:?}", self.config.socket_path);
@@ -383,11 +418,11 @@ impl Daemon {
                     match accept_result {
                         Ok((stream, _)) => {
                             let manager = Arc::clone(&self.manager);
-                            let executor = Arc::clone(&self.executor);
+                            let supervised_executor = Arc::clone(&self.supervised_executor);
                             let merge_queue = Arc::clone(&self.merge_queue);
                             let shutdown_tx = self.shutdown.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection(stream, manager, executor, merge_queue, shutdown_tx).await {
+                                if let Err(e) = handle_connection(stream, manager, supervised_executor, merge_queue, shutdown_tx).await {
                                     log::error!("Connection error: {}", e);
                                 }
                             });
@@ -425,7 +460,7 @@ impl Daemon {
 async fn handle_connection(
     stream: UnixStream,
     manager: Arc<Mutex<TaskManager>>,
-    executor: Arc<Mutex<TaskExecutor>>,
+    supervised_executor: Arc<SupervisedExecutor>,
     merge_queue: Arc<Mutex<MergeQueue>>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 ) -> Result<()> {
@@ -435,7 +470,7 @@ async fn handle_connection(
 
     while reader.read_line(&mut line).await? > 0 {
         let request: DaemonRequest = serde_json::from_str(&line)?;
-        let response = process_request(request, &manager, &executor, &merge_queue, &shutdown_tx).await;
+        let response = process_request(request, &manager, &supervised_executor, &merge_queue, &shutdown_tx).await;
 
         let response_json = serde_json::to_string(&response)?;
         writer.write_all(response_json.as_bytes()).await?;
@@ -456,7 +491,7 @@ async fn handle_connection(
 async fn process_request(
     request: DaemonRequest,
     manager: &Arc<Mutex<TaskManager>>,
-    executor: &Arc<Mutex<TaskExecutor>>,
+    supervised_executor: &Arc<SupervisedExecutor>,
     merge_queue: &Arc<Mutex<MergeQueue>>,
     shutdown_tx: &tokio::sync::broadcast::Sender<()>,
 ) -> DaemonResponse {
@@ -601,9 +636,8 @@ async fn process_request(
             // Parse working directory
             let working_dir = working_dir.map(std::path::PathBuf::from);
 
-            // Start execution
-            let mut exec = executor.lock().await;
-            match exec.start_task(task, working_dir) {
+            // Start execution through supervised executor
+            match supervised_executor.start_task(task, working_dir).await {
                 Ok(()) => {
                     // Update task status to Running
                     let mut mgr = manager.lock().await;
@@ -616,7 +650,7 @@ async fn process_request(
 
         DaemonRequest::ProvideInput { id, input } => {
             let task_id = TaskId::from_engram_id(&id);
-            let mut exec = executor.lock().await;
+            let mut exec = supervised_executor.executor().lock().await;
             match exec.provide_input(&task_id, input).await {
                 Ok(()) => DaemonResponse::Ok {
                     message: Some("Input provided".to_string()),
@@ -627,11 +661,14 @@ async fn process_request(
 
         DaemonRequest::AttachTask { id } => {
             let task_id = TaskId::from_engram_id(&id);
-            let mut exec = executor.lock().await;
+            let mut exec = supervised_executor.executor().lock().await;
 
             // Get current events (poll_events now updates state and buffers events)
             match exec.poll_events(&task_id) {
                 Ok(events) => {
+                    // Update heartbeat from events for supervision
+                    supervised_executor.update_heartbeat(&task_id, &events).await;
+
                     // Get the current state (always fresh since poll_events updates it)
                     let state = exec.get_state(&task_id);
 
@@ -649,6 +686,11 @@ async fn process_request(
                             }
                         }
                     } else {
+                        // Process events for learnings
+                        supervised_executor
+                            .process_events_for_learnings(&task_id, &events)
+                            .await;
+
                         // Return ALL events since last poll (not just last one)
                         DaemonResponse::ExecutionEvents {
                             task_id: id,
@@ -662,7 +704,7 @@ async fn process_request(
 
         DaemonRequest::GetExecutionStatus { id } => {
             let task_id = TaskId::from_engram_id(&id);
-            let exec = executor.lock().await;
+            let exec = supervised_executor.executor().lock().await;
 
             if let Some(state) = exec.get_state(&task_id) {
                 DaemonResponse::ExecutionStatusResponse {
@@ -679,9 +721,13 @@ async fn process_request(
 
         DaemonRequest::CancelTask { id } => {
             let task_id = TaskId::from_engram_id(&id);
-            let mut exec = executor.lock().await;
+            let mut exec = supervised_executor.executor().lock().await;
             match exec.cancel_task(&task_id) {
                 Ok(()) => {
+                    // Clean up supervision state
+                    drop(exec);
+                    supervised_executor.cleanup_task(&task_id).await;
+
                     // Update task status to Cancelled
                     let mut mgr = manager.lock().await;
                     let _ = mgr.set_status(&task_id, TaskStatus::Cancelled);
@@ -713,21 +759,23 @@ async fn process_request(
 
             // Start the task with worktree setup
             let repo = PathBuf::from(repo_path);
-            let mut exec = executor.lock().await;
-            match exec.start_task_with_worktree(task.clone(), Some(repo)).await {
-                Ok(()) => {
-                    // Update task status to Running
-                    let mut mgr = manager.lock().await;
-                    let _ = mgr.set_status(&task.id, TaskStatus::Running);
-                    DaemonResponse::Task(Some(task))
+            {
+                let mut exec = supervised_executor.executor().lock().await;
+                match exec.start_task_with_worktree(task.clone(), Some(repo)).await {
+                    Ok(()) => {
+                        // Update task status to Running
+                        let mut mgr = manager.lock().await;
+                        let _ = mgr.set_status(&task.id, TaskStatus::Running);
+                        DaemonResponse::Task(Some(task))
+                    }
+                    Err(e) => DaemonResponse::Error { message: e.to_string() },
                 }
-                Err(e) => DaemonResponse::Error { message: e.to_string() },
             }
         }
 
         DaemonRequest::GetWorktreeInfo { id } => {
             let task_id = TaskId::from_engram_id(&id);
-            let exec = executor.lock().await;
+            let exec = supervised_executor.executor().lock().await;
             match exec.get_worktree(&task_id) {
                 Some(info) => DaemonResponse::WorktreeInfo(Some(info.into())),
                 None => DaemonResponse::WorktreeInfo(None),
@@ -735,7 +783,7 @@ async fn process_request(
         }
 
         DaemonRequest::ListWorktrees => {
-            let exec = executor.lock().await;
+            let exec = supervised_executor.executor().lock().await;
             let worktrees: Vec<WorktreeInfoDto> = exec.git().list_worktrees().iter().map(|w| (*w).into()).collect();
             DaemonResponse::Worktrees(worktrees)
         }
@@ -750,7 +798,7 @@ async fn process_request(
 
         DaemonRequest::EnqueueMerge { id, target_branch } => {
             let task_id = TaskId::from_engram_id(&id);
-            let exec = executor.lock().await;
+            let exec = supervised_executor.executor().lock().await;
 
             // Get worktree info to determine branch and repo
             let Some(worktree) = exec.get_worktree(&task_id) else {

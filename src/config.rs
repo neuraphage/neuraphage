@@ -107,6 +107,7 @@ impl Config {
             socket_path: self.socket_path(),
             pid_path: self.pid_path(),
             data_path: self.data_dir.clone(),
+            supervision_enabled: true,
         }
     }
 }
