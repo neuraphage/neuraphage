@@ -214,6 +214,110 @@ impl TaskManager {
 
         Ok(counts)
     }
+
+    /// Store a learning as an engram item with special labels.
+    ///
+    /// Learnings are stored as engram items with:
+    /// - Label "learning" to identify them
+    /// - Label "kind:<kind>" for the learning type
+    /// - Optional "source_task:<id>" if from a specific task
+    /// - Any custom tags from the learning
+    pub fn store_learning(
+        &mut self,
+        kind: &str,
+        title: &str,
+        content: &str,
+        source_task: Option<&TaskId>,
+        tags: &[&str],
+    ) -> Result<String> {
+        let mut labels: Vec<String> = vec!["learning".to_string(), format!("kind:{}", kind)];
+
+        if let Some(task_id) = source_task {
+            labels.push(format!("source_task:{}", task_id.0));
+        }
+
+        for tag in tags {
+            labels.push((*tag).to_string());
+        }
+
+        let labels_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+
+        let item = self.store.create(title, 50, &labels_refs, Some(content))?;
+        Ok(item.id.to_string())
+    }
+
+    /// Query learnings with optional filters.
+    ///
+    /// Returns engram items that have the "learning" label.
+    pub fn query_learnings(&self, kind: Option<&str>, tags: &[&str], limit: usize) -> Result<Vec<StoredLearning>> {
+        let mut query = self.store.query().label("learning").limit(limit);
+
+        if let Some(k) = kind {
+            query = query.label(format!("kind:{}", k));
+        }
+
+        for tag in tags {
+            query = query.label(*tag);
+        }
+
+        let items = query.execute()?;
+
+        let learnings = items
+            .iter()
+            .map(|item| {
+                let kind = item
+                    .labels
+                    .iter()
+                    .find(|l| l.starts_with("kind:"))
+                    .map(|l| l.strip_prefix("kind:").unwrap_or("").to_string())
+                    .unwrap_or_default();
+
+                let source_task = item
+                    .labels
+                    .iter()
+                    .find(|l| l.starts_with("source_task:"))
+                    .map(|l| TaskId(l.strip_prefix("source_task:").unwrap_or("").to_string()));
+
+                let custom_tags: Vec<String> = item
+                    .labels
+                    .iter()
+                    .filter(|l| !l.starts_with("kind:") && !l.starts_with("source_task:") && *l != "learning")
+                    .cloned()
+                    .collect();
+
+                StoredLearning {
+                    id: item.id.to_string(),
+                    kind,
+                    title: item.title.clone(),
+                    content: item.description.clone().unwrap_or_default(),
+                    source_task,
+                    tags: custom_tags,
+                    created_at: item.created_at.to_string(),
+                }
+            })
+            .collect();
+
+        Ok(learnings)
+    }
+}
+
+/// A learning stored in engram.
+#[derive(Debug, Clone)]
+pub struct StoredLearning {
+    /// Unique identifier from engram.
+    pub id: String,
+    /// Kind of learning (e.g., "learning", "decision", "fact").
+    pub kind: String,
+    /// Title/summary.
+    pub title: String,
+    /// Full content.
+    pub content: String,
+    /// Source task that created this learning, if any.
+    pub source_task: Option<TaskId>,
+    /// Custom tags.
+    pub tags: Vec<String>,
+    /// When it was created (ISO 8601 string).
+    pub created_at: String,
 }
 
 /// Task counts by status.
