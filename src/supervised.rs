@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 
-use crate::coordination::{EventBus, KnowledgeStore};
+use crate::coordination::{Event, EventBus, EventKind, KnowledgeStore};
 use crate::coordination::{Knowledge, KnowledgeKind};
 use crate::error::{Error, Result};
 use crate::executor::{
@@ -298,17 +298,48 @@ impl SupervisedExecutor {
     async fn run_watcher_cycle_safe(&self) -> Result<()> {
         match self.run_watcher_cycle().await {
             Ok(()) => {
-                let mut health = self.health.write().await;
-                health.watcher_healthy = true;
-                health.last_watcher_cycle = Some(Utc::now());
-                health.watcher_cycles += 1;
-                health.degraded_mode = false;
+                let was_degraded = {
+                    let health = self.health.read().await;
+                    health.degraded_mode
+                };
+
+                {
+                    let mut health = self.health.write().await;
+                    health.watcher_healthy = true;
+                    health.last_watcher_cycle = Some(Utc::now());
+                    health.watcher_cycles += 1;
+                    health.degraded_mode = false;
+                }
+
+                // Publish recovery event if we were in degraded mode
+                if was_degraded {
+                    self.event_bus
+                        .publish(Event::new(EventKind::SupervisionRecovered))
+                        .await;
+                }
+
                 Ok(())
             }
             Err(e) => {
                 warn!("Watcher cycle failed, entering degraded mode: {}", e);
-                let mut health = self.health.write().await;
-                health.degraded_mode = true;
+
+                let was_degraded = {
+                    let mut health = self.health.write().await;
+                    let was = health.degraded_mode;
+                    health.degraded_mode = true;
+                    was
+                };
+
+                // Publish degraded event only on transition
+                if !was_degraded {
+                    self.event_bus
+                        .publish(
+                            Event::new(EventKind::SupervisionDegraded).with_payload(serde_json::json!({
+                                "error": e.to_string()
+                            })),
+                        )
+                        .await;
+                }
 
                 // Try degraded cycle
                 self.run_degraded_watcher_cycle().await
@@ -556,7 +587,13 @@ impl SupervisedExecutor {
 
         let executor = self.executor.lock().await;
         executor
-            .inject_message(task_id, InjectedMessage::Nudge { message, severity })
+            .inject_message(
+                task_id,
+                InjectedMessage::Nudge {
+                    message: message.clone(),
+                    severity,
+                },
+            )
             .await?;
 
         // Update stats
@@ -564,6 +601,18 @@ impl SupervisedExecutor {
             let mut health = self.health.write().await;
             health.nudges_sent += 1;
         }
+
+        // Publish event
+        self.event_bus
+            .publish(
+                Event::new(EventKind::NudgeSent)
+                    .to_task(task_id.clone())
+                    .with_payload(serde_json::json!({
+                        "message": message,
+                        "severity": format!("{:?}", severity)
+                    })),
+            )
+            .await;
 
         Ok(())
     }
@@ -597,6 +646,19 @@ impl SupervisedExecutor {
             health.syncs_relayed += 1;
         }
 
+        // Publish event
+        self.event_bus
+            .publish(
+                Event::new(EventKind::SyncRelayed)
+                    .from_task(msg.source_task.clone())
+                    .to_task(task_id.clone())
+                    .with_payload(serde_json::json!({
+                        "learning_summary": msg.learning_summary,
+                        "urgency": format!("{:?}", msg.urgency)
+                    })),
+            )
+            .await;
+
         Ok(())
     }
 
@@ -619,6 +681,17 @@ impl SupervisedExecutor {
             let mut health = self.health.write().await;
             health.tasks_paused += 1;
         }
+
+        // Publish event
+        self.event_bus
+            .publish(
+                Event::new(EventKind::TaskPaused)
+                    .to_task(task_id.clone())
+                    .with_payload(serde_json::json!({
+                        "reason": reason
+                    })),
+            )
+            .await;
 
         Ok(())
     }
@@ -840,7 +913,23 @@ impl SupervisedExecutor {
 
     /// Record a learning from a task.
     pub async fn record_learning(&self, learning: Knowledge) {
+        let source_task = learning.source_task.clone();
+        let kind = learning.kind.clone();
+        let title = learning.title.clone();
+
         let _ = self.knowledge.store(learning).await;
+
+        // Publish event
+        let mut event = Event::new(EventKind::LearningExtracted).with_payload(serde_json::json!({
+            "kind": format!("{:?}", kind),
+            "title": title
+        }));
+
+        if let Some(task_id) = source_task {
+            event = event.from_task(task_id);
+        }
+
+        self.event_bus.publish(event).await;
     }
 
     /// Process and record learnings from events.

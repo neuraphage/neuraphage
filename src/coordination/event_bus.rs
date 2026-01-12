@@ -36,6 +36,19 @@ pub enum EventKind {
     LockReleased,
     /// Rate limit reached.
     RateLimitReached,
+
+    // Supervision events
+    /// A nudge was sent to a task.
+    NudgeSent,
+    /// A sync message was relayed between tasks.
+    SyncRelayed,
+    /// A task was paused by the watcher.
+    TaskPaused,
+    /// Supervision entered degraded mode.
+    SupervisionDegraded,
+    /// Supervision recovered from degraded mode.
+    SupervisionRecovered,
+
     /// Custom event type.
     Custom(String),
 }
