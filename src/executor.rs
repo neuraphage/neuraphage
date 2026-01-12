@@ -22,7 +22,7 @@ use crate::error::{Error, Result};
 use crate::task::{Task, TaskId};
 
 /// Configuration for the task executor.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutorConfig {
     /// Maximum concurrent tasks.
     pub max_concurrent: usize,

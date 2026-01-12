@@ -14,6 +14,7 @@ pub mod personas;
 pub mod repl;
 pub mod safety;
 pub mod sandbox;
+pub mod supervised;
 pub mod task;
 pub mod task_manager;
 pub mod ui;
@@ -62,4 +63,9 @@ pub use sandbox::{SandboxAvailability, SandboxConfig, SandboxMode};
 pub use git::{
     ConflictInfo, ConflictType, GitCoordinator, MergeCop, MergeCopConfig, MergeDecision, MergeQueue, MergeRequest,
     MergeResult, ReconcileResult, ResolutionContext, ResolutionResult, WorktreeInfo, WorktreeRegistry,
+};
+
+// Re-export supervised executor types
+pub use supervised::{
+    HeartbeatFreshness, SupervisedExecutor, SupervisedExecutorConfig, SupervisionHealth, TaskHeartbeat,
 };
