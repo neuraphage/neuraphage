@@ -441,6 +441,9 @@ impl Daemon {
         // Spawn completion handler loop
         let _completion_handle = self.spawn_completion_loop();
 
+        // Spawn checkpoint loop for crash recovery
+        let _checkpoint_handle = self.spawn_checkpoint_loop();
+
         // Bind to socket
         let listener = UnixListener::bind(&self.config.socket_path)?;
         log::info!("Daemon listening on {:?}", self.config.socket_path);
@@ -585,6 +588,37 @@ impl Daemon {
                         if let Err(e) = exec.cleanup_task(&task_id).await {
                             log::warn!("Failed to cleanup task {}: {}", task_id.0, e);
                         }
+                    }
+                }
+            }
+        })
+    }
+
+    /// Spawn the checkpoint loop for crash recovery.
+    ///
+    /// Periodically checkpoints running tasks so they can be recovered
+    /// if the daemon crashes.
+    fn spawn_checkpoint_loop(&self) -> tokio::task::JoinHandle<()> {
+        let supervised_executor = Arc::clone(&self.supervised_executor);
+
+        tokio::spawn(async move {
+            // Checkpoint every 30 seconds
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+
+            loop {
+                interval.tick().await;
+
+                // Get all running task IDs
+                let task_ids: Vec<TaskId> = {
+                    let exec = supervised_executor.executor().lock().await;
+                    exec.running_task_ids()
+                };
+
+                // Checkpoint each running task
+                for task_id in task_ids {
+                    let exec = supervised_executor.executor().lock().await;
+                    if let Err(e) = exec.checkpoint_task(&task_id).await {
+                        log::warn!("Failed to checkpoint task {}: {}", task_id.0, e);
                     }
                 }
             }
