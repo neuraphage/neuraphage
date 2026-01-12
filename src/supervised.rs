@@ -19,6 +19,7 @@ use crate::error::{Error, Result};
 use crate::executor::{
     ExecutionEvent, ExecutionStatus, ExecutorConfig, InjectedMessage, NudgeSeverity, SyncUrgency, TaskExecutor,
 };
+use crate::git::{GitCoordinator, MainWatcher, MainWatcherConfig, RebaseResult};
 use crate::personas::{
     SyncMessage, Syncer, SyncerConfig, TaskSnapshot, TaskSummary, WatchResult, Watcher, WatcherConfig,
     WatcherRecommendation,
@@ -37,6 +38,9 @@ pub struct SupervisedExecutorConfig {
     /// Syncer configuration.
     #[serde(default)]
     pub syncer: SyncerConfig,
+    /// MainWatcher configuration for proactive rebasing.
+    #[serde(default)]
+    pub main_watcher: MainWatcherConfig,
     /// Enable supervision (can be disabled for testing).
     #[serde(default = "default_supervision_enabled")]
     pub supervision_enabled: bool,
@@ -59,6 +63,7 @@ impl Default for SupervisedExecutorConfig {
             executor: ExecutorConfig::default(),
             watcher: WatcherConfig::default(),
             syncer: SyncerConfig::default(),
+            main_watcher: MainWatcherConfig::default(),
             supervision_enabled: default_supervision_enabled(),
             min_task_age_secs: default_min_task_age(),
         }
@@ -152,6 +157,10 @@ pub struct SupervisedExecutor {
     watcher: Watcher,
     /// Syncer for cross-task learning.
     syncer: Arc<Mutex<Syncer>>,
+    /// MainWatcher for proactive rebasing.
+    main_watcher: Arc<Mutex<MainWatcher>>,
+    /// Git coordinator for worktree info.
+    git_coordinator: Option<Arc<Mutex<GitCoordinator>>>,
     /// Knowledge store for learnings.
     knowledge: Arc<KnowledgeStore>,
     /// Event bus for notifications.
@@ -179,6 +188,8 @@ impl SupervisedExecutor {
             executor: Arc::new(Mutex::new(executor)),
             watcher: Watcher::new(config.watcher.clone()),
             syncer: Arc::new(Mutex::new(Syncer::new(config.syncer.clone()))),
+            main_watcher: Arc::new(Mutex::new(MainWatcher::new(config.main_watcher.clone()))),
+            git_coordinator: None,
             knowledge: Arc::new(KnowledgeStore::new()),
             event_bus,
             config,
@@ -203,6 +214,8 @@ impl SupervisedExecutor {
             executor: Arc::new(Mutex::new(executor)),
             watcher,
             syncer: Arc::new(Mutex::new(syncer)),
+            main_watcher: Arc::new(Mutex::new(MainWatcher::new(config.main_watcher.clone()))),
+            git_coordinator: None,
             knowledge: Arc::new(knowledge),
             event_bus,
             config,
@@ -212,6 +225,11 @@ impl SupervisedExecutor {
             task_start_times: Arc::new(RwLock::new(HashMap::new())),
             task_metadata: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Set the git coordinator for worktree-aware rebase notifications.
+    pub fn set_git_coordinator(&mut self, git: Arc<Mutex<GitCoordinator>>) {
+        self.git_coordinator = Some(git);
     }
 
     /// Get the supervision health state.
@@ -757,6 +775,237 @@ impl SupervisedExecutor {
                 Ok(()) // Syncer failures are non-fatal
             }
         }
+    }
+
+    /// Spawn the main watcher loop for proactive rebase notifications.
+    pub fn spawn_main_watcher_loop(self: &Arc<Self>) -> JoinHandle<()> {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let interval_secs = this.config.main_watcher.interval_secs;
+            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+
+            loop {
+                interval.tick().await;
+
+                // Check if enabled
+                if !this.config.main_watcher.enabled {
+                    continue;
+                }
+
+                // Check if git coordinator is set
+                if this.git_coordinator.is_none() {
+                    continue;
+                }
+
+                if let Err(e) = this.run_main_watcher_cycle().await {
+                    error!("MainWatcher cycle error: {}", e);
+                }
+            }
+        })
+    }
+
+    /// Run a main watcher cycle - check for main updates and notify affected tasks.
+    async fn run_main_watcher_cycle(&self) -> Result<()> {
+        let git = match &self.git_coordinator {
+            Some(g) => g,
+            None => return Ok(()),
+        };
+
+        // Get all worktrees (clone each to avoid lifetime issues)
+        let worktrees: Vec<crate::git::WorktreeInfo> = {
+            let git_lock = git.lock().await;
+            let refs = git_lock.list_worktrees();
+            refs.into_iter().cloned().collect()
+        };
+
+        if worktrees.is_empty() {
+            return Ok(());
+        }
+
+        // Get unique repo paths
+        let repo_paths: std::collections::HashSet<_> = worktrees.iter().map(|w| w.repo_path.clone()).collect();
+
+        // Check for main updates in each repo
+        for repo_path in repo_paths {
+            let mut main_watcher = self.main_watcher.lock().await;
+
+            // Check if main has new commits
+            if let Some(update) = main_watcher.check_for_updates(&repo_path).await? {
+                // Publish MainUpdated event
+                self.event_bus
+                    .publish(Event::new(EventKind::MainUpdated).with_payload(serde_json::json!({
+                        "repo": repo_path.to_string_lossy(),
+                        "new_commit": update.new_commit,
+                        "branch": update.branch,
+                    })))
+                    .await;
+
+                info!(
+                    "Main branch updated in {}: {}",
+                    repo_path.display(),
+                    &update.new_commit[..7.min(update.new_commit.len())]
+                );
+
+                // Find affected worktrees in this repo
+                for worktree in worktrees.iter().filter(|w| w.repo_path == repo_path) {
+                    // Check if this branch is behind main
+                    if main_watcher.is_behind_main(&repo_path, &worktree.branch).await? {
+                        // Check cooldown
+                        if !main_watcher.cooldown_elapsed(&worktree.task_id) {
+                            debug!(
+                                "Skipping rebase notification for {} - cooldown not elapsed",
+                                worktree.task_id.0
+                            );
+                            continue;
+                        }
+
+                        // Get commits since divergence for context
+                        let commits = main_watcher
+                            .commits_since_divergence(&repo_path, &worktree.branch)
+                            .await?;
+
+                        let commits_behind = commits.len();
+                        let commit_summaries: Vec<String> = commits
+                            .iter()
+                            .take(5) // Limit to 5 most recent
+                            .map(|c| format!("{}: {}", &c.sha[..7.min(c.sha.len())], c.message))
+                            .collect();
+
+                        // Publish RebaseRequired event
+                        self.event_bus
+                            .publish(
+                                Event::new(EventKind::RebaseRequired)
+                                    .from_task(worktree.task_id.clone())
+                                    .with_payload(serde_json::json!({
+                                        "commits_behind": commits_behind,
+                                        "new_commits": commit_summaries,
+                                    })),
+                            )
+                            .await;
+
+                        // Inject rebase notification
+                        if let Err(e) = self
+                            .inject_rebase_notification(&worktree.task_id, commits_behind, commit_summaries)
+                            .await
+                        {
+                            warn!("Failed to inject rebase notification to {}: {}", worktree.task_id.0, e);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Inject a rebase notification into a task.
+    pub async fn inject_rebase_notification(
+        &self,
+        task_id: &TaskId,
+        commits_behind: usize,
+        new_commits: Vec<String>,
+    ) -> Result<()> {
+        info!(
+            "Injecting rebase notification to {}: {} commits behind",
+            task_id.0, commits_behind
+        );
+
+        let urgency = SyncUrgency::Helpful; // Use config value in real implementation
+
+        let executor = self.executor.lock().await;
+        executor
+            .inject_message(
+                task_id,
+                InjectedMessage::Rebase {
+                    commits_behind,
+                    new_commits: new_commits.clone(),
+                    urgency,
+                },
+            )
+            .await?;
+
+        // Publish event
+        self.event_bus
+            .publish(
+                Event::new(EventKind::RebaseRequired)
+                    .to_task(task_id.clone())
+                    .with_payload(serde_json::json!({
+                        "commits_behind": commits_behind,
+                        "new_commits": new_commits
+                    })),
+            )
+            .await;
+
+        Ok(())
+    }
+
+    /// Manually trigger a rebase for a task.
+    pub async fn trigger_rebase(&self, task_id: &TaskId) -> Result<RebaseResult> {
+        // Get worktree info for this task
+        let git = match &self.git_coordinator {
+            Some(g) => g,
+            None => {
+                return Ok(RebaseResult::Failed {
+                    reason: "Git coordinator not configured".to_string(),
+                });
+            }
+        };
+
+        let worktree: Option<crate::git::WorktreeInfo> = {
+            let git_lock = git.lock().await;
+            let refs = git_lock.list_worktrees();
+            refs.into_iter().find(|w| &w.task_id == task_id).cloned()
+        };
+
+        let worktree = match worktree {
+            Some(w) => w,
+            None => {
+                return Ok(RebaseResult::Failed {
+                    reason: format!("No worktree found for task {}", task_id.0),
+                });
+            }
+        };
+
+        // Perform rebase
+        let mut main_watcher = self.main_watcher.lock().await;
+        let result = main_watcher.perform_rebase(task_id, &worktree.path).await?;
+
+        // Publish appropriate event based on result
+        match &result {
+            RebaseResult::Success {
+                previous_head,
+                new_head,
+            } => {
+                self.event_bus
+                    .publish(
+                        Event::new(EventKind::RebaseCompleted)
+                            .from_task(task_id.clone())
+                            .with_payload(serde_json::json!({
+                                "previous_head": previous_head,
+                                "new_head": new_head,
+                            })),
+                    )
+                    .await;
+            }
+            RebaseResult::Conflict {
+                details,
+                conflicting_files,
+            } => {
+                self.event_bus
+                    .publish(
+                        Event::new(EventKind::RebaseConflict)
+                            .from_task(task_id.clone())
+                            .with_payload(serde_json::json!({
+                                "details": details,
+                                "conflicting_files": conflicting_files,
+                            })),
+                    )
+                    .await;
+            }
+            _ => {}
+        }
+
+        Ok(result)
     }
 
     /// Run a full syncer cycle.
