@@ -364,8 +364,10 @@ pub struct Workstream {
     pub status: TaskStatus,
     /// Live output buffer (VecDeque used as ring buffer).
     pub output: VecDeque<OutputLine>,
-    /// Progress indicator (0.0-1.0).
+    /// Target progress indicator (0.0-1.0) - the actual progress.
     pub progress: f32,
+    /// Display progress for smooth animation (lerps toward progress).
+    display_progress: f32,
     /// Current iteration.
     pub iteration: u32,
     /// Cost for this workstream in USD.
@@ -396,6 +398,7 @@ impl Workstream {
             status,
             output: VecDeque::with_capacity(MAX_OUTPUT_LINES),
             progress: 0.0,
+            display_progress: 0.0,
             iteration: 0,
             cost: 0.0,
             tokens: 0,
@@ -404,6 +407,27 @@ impl Workstream {
             attention_reason: None,
             worktree_path: None,
             idle_duration: Duration::ZERO,
+        }
+    }
+
+    /// Set the target progress and start animating toward it.
+    pub fn set_progress(&mut self, progress: f32) {
+        self.progress = progress.clamp(0.0, 1.0);
+    }
+
+    /// Get the display progress (animated value).
+    pub fn display_progress(&self) -> f32 {
+        self.display_progress
+    }
+
+    /// Tick animation - call once per frame for smooth progress bar.
+    /// Uses exponential lerp for natural-feeling animation.
+    pub fn tick_animation(&mut self) {
+        const LERP_FACTOR: f32 = 0.15;
+        self.display_progress += (self.progress - self.display_progress) * LERP_FACTOR;
+        // Snap to target when close enough to avoid drift
+        if (self.progress - self.display_progress).abs() < 0.001 {
+            self.display_progress = self.progress;
         }
     }
 
@@ -898,6 +922,14 @@ impl ParallelTuiApp {
         Self {
             state: ParallelTuiState::from_settings(settings),
             should_quit: false,
+        }
+    }
+
+    /// Tick all animations - call once per frame.
+    pub fn tick(&mut self) {
+        self.state.tick();
+        for workstream in &mut self.state.workstreams {
+            workstream.tick_animation();
         }
     }
 
@@ -1662,48 +1694,113 @@ impl ParallelTuiApp {
             SortOrder::Name => "name",
         };
 
-        let help_text = format!(
-            " {} [{}] Sort: {} | [j/k] Nav [Space] Split [g] Grid [Enter] Focus [s] Sort [?] Help [q] Quit ",
-            connection_indicator, mode_text, sort_text
-        );
-        let style = Style::default().bg(Color::Rgb(30, 30, 30)).fg(Color::White);
-        let paragraph = Paragraph::new(help_text).style(style);
+        // Show mode-specific status
+        let mode_indicator = match &self.state.interaction_mode {
+            InteractionMode::Normal => "".into(),
+            InteractionMode::Input(_) => " [INPUT] ".yellow().bold(),
+            InteractionMode::Search(_) => " [SEARCH] ".cyan().bold(),
+            InteractionMode::Confirm(_) => " [CONFIRM] ".red().bold(),
+            InteractionMode::TaskEvents => " [EVENTS] ".blue().bold(),
+        };
+
+        // Filter indicator
+        let filter_indicator = if self.state.filter.name_filter.is_some() || self.state.filter.attention_only {
+            " [FILTERED]".yellow()
+        } else {
+            "".into()
+        };
+
+        // Build status line with spans for proper rendering
+        let status_line = Line::from(vec![
+            " ".into(),
+            connection_indicator,
+            " ".into(),
+            Span::styled(mode_text, Style::default().fg(Color::Cyan)),
+            " │ Sort: ".dark_gray(),
+            Span::styled(sort_text, Style::default().fg(Color::White)),
+            mode_indicator,
+            filter_indicator,
+            " │ ".dark_gray(),
+            "?".cyan(),
+            " Help ".dark_gray(),
+            "q".cyan(),
+            " Quit".dark_gray(),
+        ]);
+
+        let style = Style::default().bg(Color::Rgb(30, 30, 30));
+        let paragraph = Paragraph::new(status_line).style(style);
         frame.render_widget(paragraph, area);
     }
 
     /// Render help popup overlay.
     fn render_help_popup(&self, frame: &mut Frame) {
-        let area = centered_rect(60, 70, frame.area());
+        let area = centered_rect(65, 80, frame.area());
         frame.render_widget(Clear, area);
 
         let help_text = vec![
-            Line::from("Keyboard Shortcuts".bold()),
+            Line::from(vec![
+                "─────────── ".dark_gray(),
+                "Navigation".bold().cyan(),
+                " ───────────".dark_gray(),
+            ]),
+            Line::from(vec!["  1-9".cyan(), " │ Jump to workstream by index".into()]),
+            Line::from(vec!["  j/↓".cyan(), " │ Next workstream".into()]),
+            Line::from(vec!["  k/↑".cyan(), " │ Previous workstream".into()]),
+            Line::from(vec!["  Tab".cyan(), " │ Cycle focus in split mode".into()]),
             Line::from(""),
-            Line::from(vec!["1-9".cyan(), " - Jump to workstream by index".into()]),
-            Line::from(vec!["j/↓".cyan(), " - Next workstream".into()]),
-            Line::from(vec!["k/↑".cyan(), " - Previous workstream".into()]),
-            Line::from(vec!["Tab".cyan(), " - Cycle focus in split mode".into()]),
+            Line::from(vec![
+                "─────────── ".dark_gray(),
+                "Layout Modes".bold().cyan(),
+                " ─────────".dark_gray(),
+            ]),
+            Line::from(vec!["    d".cyan(), " │ Dashboard (default)".into()]),
+            Line::from(vec!["Space".cyan(), " │ Toggle split view".into()]),
+            Line::from(vec!["    g".cyan(), " │ Toggle grid view".into()]),
+            Line::from(vec!["Enter".cyan(), " │ Toggle focus mode".into()]),
             Line::from(""),
-            Line::from("Layout Modes".bold()),
-            Line::from(vec!["d".cyan(), " - Dashboard (default)".into()]),
-            Line::from(vec!["Space".cyan(), " - Toggle split view".into()]),
-            Line::from(vec!["g".cyan(), " - Toggle grid view".into()]),
-            Line::from(vec!["Enter".cyan(), " - Toggle focus mode".into()]),
+            Line::from(vec![
+                "─────────── ".dark_gray(),
+                "Interaction".bold().cyan(),
+                " ──────────".dark_gray(),
+            ]),
+            Line::from(vec!["    a".cyan(), " │ Send input to workstream".into()]),
+            Line::from(vec!["    /".cyan(), " │ Search/filter workstreams".into()]),
+            Line::from(vec!["    t".cyan(), " │ View task events".into()]),
+            Line::from(vec!["    f".cyan(), " │ Toggle attention filter".into()]),
             Line::from(""),
-            Line::from("Actions".bold()),
-            Line::from(vec!["s".cyan(), " - Cycle sort order".into()]),
-            Line::from(vec!["?".cyan(), " - Toggle help".into()]),
-            Line::from(vec!["q".cyan(), " - Quit".into()]),
-            Line::from(vec!["Ctrl+C".cyan(), " - Force quit".into()]),
+            Line::from(vec![
+                "─────────── ".dark_gray(),
+                "Actions".bold().cyan(),
+                " ───────────────".dark_gray(),
+            ]),
+            Line::from(vec!["    s".cyan(), " │ Cycle sort order".into()]),
+            Line::from(vec!["    x".cyan(), " │ Cancel task (with confirm)".into()]),
+            Line::from(vec!["    ?".cyan(), " │ Toggle help".into()]),
+            Line::from(vec!["    q".cyan(), " │ Quit (confirm if running)".into()]),
+            Line::from(vec!["Esc  ".cyan(), " │ Exit mode / Clear filter".into()]),
+            Line::from(vec!["Ctrl+C".cyan(), "│ Force quit".into()]),
             Line::from(""),
-            Line::from("Press ESC or ? to close".dark_gray()),
+            Line::from(vec![
+                "─────────── ".dark_gray(),
+                "Mode Indicators".bold().cyan(),
+                " ────────".dark_gray(),
+            ]),
+            Line::from(vec!["  ●".green(), " Running".into()]),
+            Line::from(vec!["  ?".yellow(), " Waiting for user".into()]),
+            Line::from(vec!["  ○".dark_gray(), " Queued".into()]),
+            Line::from(vec!["  ✓".green(), " Completed".into()]),
+            Line::from(vec!["  ✗".red(), " Failed".into()]),
+            Line::from(""),
+            Line::from("Press ESC or ? to close".dark_gray().italic()),
         ];
 
         let block = Block::default()
             .title(" Help ")
+            .title_style(Style::default().bold().cyan())
             .borders(Borders::ALL)
-            .border_set(border::ROUNDED)
-            .style(Style::default().bg(Color::Black));
+            .border_set(border::DOUBLE)
+            .border_style(Style::default().fg(Color::Cyan))
+            .style(Style::default().bg(Color::Rgb(20, 20, 30)));
 
         let paragraph = Paragraph::new(help_text).block(block).wrap(Wrap { trim: true });
         frame.render_widget(paragraph, area);
