@@ -1311,8 +1311,8 @@ fn handle_counts_response(response: DaemonResponse) {
 }
 
 /// Run the parallel workstream TUI.
-async fn run_tui(_client: DaemonClient, config: &Config, layout: Option<String>, filter: Vec<String>) -> Result<()> {
-    use neuraphage::tui::ParallelTuiApp;
+async fn run_tui(client: DaemonClient, config: &Config, layout: Option<String>, filter: Vec<String>) -> Result<()> {
+    use neuraphage::tui::TuiRunner;
 
     // Parse layout mode override
     let layout_mode = layout.as_ref().and_then(|s| parse_layout_mode(s));
@@ -1327,23 +1327,19 @@ async fn run_tui(_client: DaemonClient, config: &Config, layout: Option<String>,
         return Ok(());
     }
 
-    // Initialize TUI
-    let mut app = ParallelTuiApp::from_settings(&config.tui);
+    // Create TUI runner
+    let mut runner = TuiRunner::new(client, config).await.map_err(|e| eyre::eyre!("{}", e))?;
+
+    // Apply overrides
     if let Some(mode) = layout_mode {
-        app.state.layout_mode = mode;
+        runner.set_layout_mode(mode);
     }
     if !filter.is_empty() {
-        app.state.filter.task_ids = filter;
+        runner.set_task_filter(filter);
     }
 
-    // TODO: Implement TuiRunner in Phase 2-3
-    // For now, just show a message
-    println!("{} TUI mode not yet implemented. Coming soon!", "!".yellow());
-    println!();
-    println!("  Layout: {:?}", app.state.layout_mode);
-    println!("  Filter: {:?}", app.state.filter.task_ids);
-
-    Ok(())
+    // Run the TUI event loop
+    runner.run().await.map_err(|e| eyre::eyre!("{}", e))
 }
 
 /// Parse layout mode from string.
