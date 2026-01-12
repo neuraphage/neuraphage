@@ -250,6 +250,21 @@ pub enum Command {
         id: String,
     },
 
+    /// Show recovery report (tasks that can be resumed after crash)
+    Recover,
+
+    /// Resume a task from its last checkpoint
+    Resume {
+        /// Task ID
+        id: String,
+    },
+
+    /// Force checkpoint a running task
+    Checkpoint {
+        /// Task ID
+        id: String,
+    },
+
     /// Manage git worktrees
     #[command(subcommand)]
     Worktree(WorktreeCommand),

@@ -456,6 +456,65 @@ async fn run_client_command(config: &Config, command: Command) -> Result<()> {
             }
         }
 
+        Command::Recover => {
+            let request = DaemonRequest::GetRecoveryReport;
+            let response = client.request(request).await?;
+            match response {
+                DaemonResponse::RecoveryReport { tasks } => {
+                    if tasks.is_empty() {
+                        println!("{} No recoverable tasks found", "✓".green());
+                    } else {
+                        println!(
+                            "{} {} recoverable task(s) from previous session:\n",
+                            "!".yellow(),
+                            tasks.len()
+                        );
+                        for task in &tasks {
+                            println!(
+                                "  {} {} (iteration {}, {} tokens, ${})",
+                                "•".blue(),
+                                task.task_id,
+                                task.iteration,
+                                task.tokens_used,
+                                task.cost
+                            );
+                            println!("    Phase: {}", task.phase);
+                            println!("    Working dir: {}", task.working_dir);
+                            println!("    Checkpoint: {}", task.checkpoint_at);
+                            println!();
+                        }
+                        println!("Use {} to resume a task", "np resume <id>".cyan());
+                    }
+                }
+                DaemonResponse::Error { message } => eprintln!("{} {}", "✗".red(), message),
+                _ => {}
+            }
+        }
+
+        Command::Resume { id } => {
+            let request = DaemonRequest::ResumeTask { id: id.clone() };
+            let response = client.request(request).await?;
+            match response {
+                DaemonResponse::TaskResumed { task_id } => {
+                    println!("{} Task {} resumed from checkpoint", "✓".green(), task_id);
+                }
+                DaemonResponse::Error { message } => eprintln!("{} {}", "✗".red(), message),
+                _ => {}
+            }
+        }
+
+        Command::Checkpoint { id } => {
+            // Force checkpoint a running task
+            // Note: Currently we use the periodic checkpointing. For manual checkpoint,
+            // we would need to add a new daemon request. For now, just inform the user.
+            println!(
+                "{} Task {} will be checkpointed automatically every 30 seconds",
+                "i".blue(),
+                id
+            );
+            println!("Manual checkpoint forcing is not yet implemented.");
+        }
+
         Command::Worktree(worktree_cmd) => match worktree_cmd {
             WorktreeCommand::List => {
                 let request = DaemonRequest::ListWorktrees;
