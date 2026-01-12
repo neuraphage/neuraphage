@@ -130,8 +130,12 @@ pub enum Command {
         tags: Vec<String>,
 
         /// Extended context
-        #[arg(short, long)]
+        #[arg(short = 'x', long)]
         context: Option<String>,
+
+        /// Git repository path (creates worktree for task isolation)
+        #[arg(short, long)]
+        repo: Option<PathBuf>,
     },
 
     /// List tasks
@@ -220,8 +224,12 @@ pub enum Command {
         tags: Vec<String>,
 
         /// Extended context
-        #[arg(short, long)]
+        #[arg(short = 'x', long)]
         context: Option<String>,
+
+        /// Git repository path (creates worktree for task isolation)
+        #[arg(short, long)]
+        repo: Option<PathBuf>,
     },
 
     /// Attach to a running task
@@ -240,6 +248,44 @@ pub enum Command {
     Cancel {
         /// Task ID
         id: String,
+    },
+
+    /// Manage git worktrees
+    #[command(subcommand)]
+    Worktree(WorktreeCommand),
+
+    /// Manage merge queue
+    #[command(subcommand)]
+    Merge(MergeCommand),
+}
+
+/// Worktree management commands.
+#[derive(Subcommand)]
+pub enum WorktreeCommand {
+    /// List all active worktrees
+    List,
+
+    /// Show worktree info for a task
+    Info {
+        /// Task ID
+        id: String,
+    },
+}
+
+/// Merge queue commands.
+#[derive(Subcommand)]
+pub enum MergeCommand {
+    /// Show merge queue status
+    Queue,
+
+    /// Enqueue a task's branch for merging
+    Enqueue {
+        /// Task ID
+        id: String,
+
+        /// Target branch (default: main)
+        #[arg(short, long)]
+        target: Option<String>,
     },
 }
 
@@ -306,5 +352,48 @@ mod tests {
     fn test_daemon_status() {
         let cli = Cli::parse_from(["np", "daemon", "status"]);
         assert!(matches!(cli.command, Some(Command::Daemon(DaemonCommand::Status))));
+    }
+
+    #[test]
+    fn test_new_with_repo() {
+        let cli = Cli::parse_from(["np", "new", "test task", "--repo", "/tmp/repo"]);
+        if let Some(Command::New { repo, .. }) = cli.command {
+            assert_eq!(repo, Some(PathBuf::from("/tmp/repo")));
+        } else {
+            panic!("Expected New command");
+        }
+    }
+
+    #[test]
+    fn test_worktree_list() {
+        let cli = Cli::parse_from(["np", "worktree", "list"]);
+        assert!(matches!(cli.command, Some(Command::Worktree(WorktreeCommand::List))));
+    }
+
+    #[test]
+    fn test_worktree_info() {
+        let cli = Cli::parse_from(["np", "worktree", "info", "task-123"]);
+        if let Some(Command::Worktree(WorktreeCommand::Info { id })) = cli.command {
+            assert_eq!(id, "task-123");
+        } else {
+            panic!("Expected Worktree Info command");
+        }
+    }
+
+    #[test]
+    fn test_merge_queue() {
+        let cli = Cli::parse_from(["np", "merge", "queue"]);
+        assert!(matches!(cli.command, Some(Command::Merge(MergeCommand::Queue))));
+    }
+
+    #[test]
+    fn test_merge_enqueue() {
+        let cli = Cli::parse_from(["np", "merge", "enqueue", "task-123", "--target", "develop"]);
+        if let Some(Command::Merge(MergeCommand::Enqueue { id, target })) = cli.command {
+            assert_eq!(id, "task-123");
+            assert_eq!(target, Some("develop".to_string()));
+        } else {
+            panic!("Expected Merge Enqueue command");
+        }
     }
 }

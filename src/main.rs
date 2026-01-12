@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 mod cli;
 
-use cli::{Cli, Command, DaemonCommand};
+use cli::{Cli, Command, DaemonCommand, MergeCommand, WorktreeCommand};
 use neuraphage::config::Config;
 use neuraphage::daemon::{
     ActivityDto, Daemon, DaemonClient, DaemonRequest, DaemonResponse, ExecutionEventDto, ExecutionStatusDto,
@@ -257,14 +257,25 @@ async fn run_client_command(config: &Config, command: Command) -> Result<()> {
             priority,
             tags,
             context,
+            repo,
         } => {
-            let working_dir = std::env::current_dir().ok().map(|d| d.to_string_lossy().to_string());
-            let request = DaemonRequest::CreateTask {
-                description,
-                priority,
-                tags,
-                context,
-                working_dir,
+            let request = if let Some(repo_path) = repo {
+                DaemonRequest::CreateTaskWithWorktree {
+                    description,
+                    priority,
+                    tags,
+                    context,
+                    repo_path: repo_path.to_string_lossy().to_string(),
+                }
+            } else {
+                let working_dir = std::env::current_dir().ok().map(|d| d.to_string_lossy().to_string());
+                DaemonRequest::CreateTask {
+                    description,
+                    priority,
+                    tags,
+                    context,
+                    working_dir,
+                }
             };
             let response = client.request(request).await?;
             handle_task_response(response);
@@ -345,19 +356,30 @@ async fn run_client_command(config: &Config, command: Command) -> Result<()> {
             priority,
             tags,
             context,
+            repo,
         } => {
             // Use provided directory or current working directory
             let working_dir = dir
                 .map(|d| d.to_string_lossy().to_string())
                 .or_else(|| std::env::current_dir().ok().map(|d| d.to_string_lossy().to_string()));
 
-            // Create the task
-            let request = DaemonRequest::CreateTask {
-                description: description.clone(),
-                priority,
-                tags,
-                context,
-                working_dir: working_dir.clone(),
+            // Create the task (with worktree if repo specified)
+            let request = if let Some(repo_path) = repo {
+                DaemonRequest::CreateTaskWithWorktree {
+                    description: description.clone(),
+                    priority,
+                    tags,
+                    context,
+                    repo_path: repo_path.to_string_lossy().to_string(),
+                }
+            } else {
+                DaemonRequest::CreateTask {
+                    description: description.clone(),
+                    priority,
+                    tags,
+                    context,
+                    working_dir: working_dir.clone(),
+                }
             };
             let response = client.request(request).await?;
 
@@ -433,6 +455,84 @@ async fn run_client_command(config: &Config, command: Command) -> Result<()> {
                 _ => {}
             }
         }
+
+        Command::Worktree(worktree_cmd) => match worktree_cmd {
+            WorktreeCommand::List => {
+                let request = DaemonRequest::ListWorktrees;
+                let response = client.request(request).await?;
+                match response {
+                    DaemonResponse::Worktrees(worktrees) => {
+                        if worktrees.is_empty() {
+                            println!("{} No active worktrees", "○".yellow());
+                        } else {
+                            println!("{} Active Worktrees", "🌲".green());
+                            println!();
+                            for wt in worktrees {
+                                println!("  {} {}", wt.task_id.cyan(), wt.branch);
+                                println!("    Path: {}", wt.path.dimmed());
+                            }
+                        }
+                    }
+                    DaemonResponse::Error { message } => eprintln!("{} {}", "✗".red(), message),
+                    _ => {}
+                }
+            }
+            WorktreeCommand::Info { id } => {
+                let request = DaemonRequest::GetWorktreeInfo { id };
+                let response = client.request(request).await?;
+                match response {
+                    DaemonResponse::WorktreeInfo(Some(wt)) => {
+                        println!("{} Worktree Info", "🌲".green());
+                        println!();
+                        println!("  Task:    {}", wt.task_id.cyan());
+                        println!("  Branch:  {}", wt.branch);
+                        println!("  Path:    {}", wt.path);
+                        println!("  Repo:    {}", wt.repo_path);
+                        println!("  Created: {}", wt.created_at);
+                    }
+                    DaemonResponse::WorktreeInfo(None) => {
+                        println!("{} No worktree for this task", "○".yellow());
+                    }
+                    DaemonResponse::Error { message } => eprintln!("{} {}", "✗".red(), message),
+                    _ => {}
+                }
+            }
+        },
+
+        Command::Merge(merge_cmd) => match merge_cmd {
+            MergeCommand::Queue => {
+                let request = DaemonRequest::MergeQueueStatus;
+                let response = client.request(request).await?;
+                match response {
+                    DaemonResponse::MergeQueueStatusResponse { pending, active } => {
+                        println!("{} Merge Queue Status", "🔀".blue());
+                        println!();
+                        println!("  Pending: {}", pending);
+                        if let Some(task_id) = active {
+                            println!("  Active:  {}", task_id.cyan());
+                        } else {
+                            println!("  Active:  {}", "none".dimmed());
+                        }
+                    }
+                    DaemonResponse::Error { message } => eprintln!("{} {}", "✗".red(), message),
+                    _ => {}
+                }
+            }
+            MergeCommand::Enqueue { id, target } => {
+                let request = DaemonRequest::EnqueueMerge {
+                    id,
+                    target_branch: target,
+                };
+                let response = client.request(request).await?;
+                match response {
+                    DaemonResponse::MergeEnqueued { task_id } => {
+                        println!("{} Task {} enqueued for merge", "✓".green(), task_id.cyan());
+                    }
+                    DaemonResponse::Error { message } => eprintln!("{} {}", "✗".red(), message),
+                    _ => {}
+                }
+            }
+        },
     }
 
     Ok(())
