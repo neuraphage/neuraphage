@@ -103,7 +103,7 @@ impl EventKind {
     }
 
     /// Convert to string representation for storage.
-    pub fn to_string(&self) -> String {
+    pub fn as_storage_str(&self) -> String {
         match self {
             EventKind::TaskStarted => "task_started".to_string(),
             EventKind::TaskCompleted => "task_completed".to_string(),
@@ -299,14 +299,14 @@ impl EventBus {
     /// Publish an event.
     pub async fn publish(&self, event: Event) {
         // Persist durable events to engram (fire-and-forget)
-        if let Some(store) = &self.engram_store {
-            if event.kind.is_durable() {
-                let engram_event = self.to_engram_event(&event);
-                if let Ok(mut s) = store.lock() {
-                    if let Err(e) = s.record_event_raw(&engram_event) {
-                        log::warn!("Failed to persist event to engram: {}", e);
-                    }
-                }
+        if let Some(store) = &self.engram_store
+            && event.kind.is_durable()
+        {
+            let engram_event = self.to_engram_event(&event);
+            if let Ok(mut s) = store.lock()
+                && let Err(e) = s.record_event_raw(&engram_event)
+            {
+                log::warn!("Failed to persist event to engram: {}", e);
             }
         }
 
@@ -333,7 +333,7 @@ impl EventBus {
     fn to_engram_event(&self, event: &Event) -> engram::Event {
         engram::Event {
             id: format!("eg-evt-{}", &event.id[..10.min(event.id.len())]),
-            kind: event.kind.to_string(),
+            kind: event.kind.as_storage_str(),
             source_task: event.source_task.as_ref().map(|t| t.0.clone()),
             target_task: event.target_task.as_ref().map(|t| t.0.clone()),
             payload: event.payload.clone(),

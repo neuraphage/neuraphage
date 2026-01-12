@@ -650,10 +650,16 @@ impl Daemon {
                     // Publish completion event
                     match &result.status {
                         ExecutionStatus::Completed { reason } => {
-                            supervised_executor.event_bus().task_completed(task_id.clone(), reason).await;
+                            supervised_executor
+                                .event_bus()
+                                .task_completed(task_id.clone(), reason)
+                                .await;
                         }
                         ExecutionStatus::Failed { error } => {
-                            supervised_executor.event_bus().task_failed(task_id.clone(), error).await;
+                            supervised_executor
+                                .event_bus()
+                                .task_failed(task_id.clone(), error)
+                                .await;
                         }
                         ExecutionStatus::Cancelled => {
                             supervised_executor.event_bus().task_cancelled(task_id.clone()).await;
@@ -1218,9 +1224,13 @@ async fn process_request(
             match supervised_executor.trigger_rebase(&task_id).await {
                 Ok(result) => {
                     let (success, message) = match result {
-                        crate::git::RebaseResult::Success { previous_head, new_head } => {
-                            (true, format!("Rebased from {} to {}", &previous_head[..8], &new_head[..8]))
-                        }
+                        crate::git::RebaseResult::Success {
+                            previous_head,
+                            new_head,
+                        } => (
+                            true,
+                            format!("Rebased from {} to {}", &previous_head[..8], &new_head[..8]),
+                        ),
                         crate::git::RebaseResult::Conflict { details, .. } => (false, format!("Conflict: {}", details)),
                         crate::git::RebaseResult::Failed { reason } => (false, format!("Failed: {}", reason)),
                         crate::git::RebaseResult::Skipped { reason } => (true, format!("Skipped: {}", reason)),

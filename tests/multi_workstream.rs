@@ -70,14 +70,9 @@ async fn test_task_lifecycle_events() {
     let received_clone = received.clone();
     let mut subscription = event_bus.subscribe();
     let _collector = tokio::spawn(async move {
-        loop {
-            match tokio::time::timeout(Duration::from_millis(200), subscription.recv()).await {
-                Ok(Some(event)) => {
-                    let mut r = received_clone.lock().await;
-                    r.push((event.kind.clone(), event.source_task.clone()));
-                }
-                _ => break,
-            }
+        while let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(200), subscription.recv()).await {
+            let mut r = received_clone.lock().await;
+            r.push((event.kind.clone(), event.source_task.clone()));
         }
     });
 
@@ -113,7 +108,9 @@ async fn test_event_history_query() {
     for i in 0..3 {
         let task_id = TaskId(format!("task-{}", i));
         event_bus.task_started(task_id.clone()).await;
-        event_bus.file_modified(task_id.clone(), &format!("/file_{}.rs", i)).await;
+        event_bus
+            .file_modified(task_id.clone(), &format!("/file_{}.rs", i))
+            .await;
         event_bus.task_completed(task_id.clone(), "Done").await;
     }
 
@@ -155,10 +152,8 @@ async fn test_high_concurrency_event_stress() {
             let task_id = TaskId(format!("stress-task-{}", task_num));
             tokio::spawn(async move {
                 for i in 0..events_to_publish {
-                    bus.publish(
-                        Event::new(EventKind::Custom(format!("event-{}", i)))
-                            .from_task(task_id.clone())
-                    ).await;
+                    bus.publish(Event::new(EventKind::Custom(format!("event-{}", i))).from_task(task_id.clone()))
+                        .await;
                 }
             })
         })
@@ -204,35 +199,40 @@ async fn test_coordination_events() {
     ]);
 
     let _collector = tokio::spawn(async move {
-        loop {
-            match tokio::time::timeout(Duration::from_millis(200), subscription.recv()).await {
-                Ok(Some(event)) => {
-                    let mut r = received_clone.lock().await;
-                    r.push(event.kind.clone());
-                }
-                _ => break,
-            }
+        while let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(200), subscription.recv()).await {
+            let mut r = received_clone.lock().await;
+            r.push(event.kind.clone());
         }
     });
 
     sleep(Duration::from_millis(10)).await;
 
     // Simulate coordination sequence
-    event_bus.publish(Event::new(EventKind::MainUpdated)
-        .with_payload(serde_json::json!({"commit": "abc123"}))).await;
+    event_bus
+        .publish(Event::new(EventKind::MainUpdated).with_payload(serde_json::json!({"commit": "abc123"})))
+        .await;
 
     let task_id = TaskId("task-needs-rebase".to_string());
-    event_bus.publish(Event::new(EventKind::RebaseRequired)
-        .to_task(task_id.clone())
-        .with_payload(serde_json::json!({"commits_behind": 3}))).await;
+    event_bus
+        .publish(
+            Event::new(EventKind::RebaseRequired)
+                .to_task(task_id.clone())
+                .with_payload(serde_json::json!({"commits_behind": 3})),
+        )
+        .await;
 
-    event_bus.publish(Event::new(EventKind::RebaseCompleted)
-        .from_task(task_id.clone())).await;
+    event_bus
+        .publish(Event::new(EventKind::RebaseCompleted).from_task(task_id.clone()))
+        .await;
 
-    event_bus.publish(Event::new(EventKind::SyncRelayed)
-        .from_task(TaskId("task-a".to_string()))
-        .to_task(TaskId("task-b".to_string()))
-        .with_payload(serde_json::json!({"learning": "use async"}))).await;
+    event_bus
+        .publish(
+            Event::new(EventKind::SyncRelayed)
+                .from_task(TaskId("task-a".to_string()))
+                .to_task(TaskId("task-b".to_string()))
+                .with_payload(serde_json::json!({"learning": "use async"})),
+        )
+        .await;
 
     sleep(Duration::from_millis(300)).await;
 

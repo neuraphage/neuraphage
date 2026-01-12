@@ -454,7 +454,9 @@ async fn handle_events_command(config: &Config, cmd: EventsCommand) -> Result<()
         }
 
         EventsCommand::Task { id, limit } => {
-            let counts = store.task_event_counts(&id).context("Failed to get task event counts")?;
+            let counts = store
+                .task_event_counts(&id)
+                .context("Failed to get task event counts")?;
 
             if counts.total == 0 {
                 println!("{} No events for task {}", "○".yellow(), id.cyan());
@@ -870,7 +872,10 @@ async fn run_client_command(config: &Config, command: Command) -> Result<()> {
                                 let status_icon = if task.needs_rebase { "!".yellow() } else { "✓".green() };
                                 println!(
                                     "  {} {} ({}) - {} commits behind",
-                                    status_icon, task.task_id.cyan(), task.branch, task.commits_behind
+                                    status_icon,
+                                    task.task_id.cyan(),
+                                    task.branch,
+                                    task.commits_behind
                                 );
                             }
                         }

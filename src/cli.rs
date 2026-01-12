@@ -594,10 +594,7 @@ mod tests {
             "10",
         ]);
         if let Some(Command::Events(EventsCommand::List {
-            kind,
-            source,
-            limit,
-            ..
+            kind, source, limit, ..
         })) = cli.command
         {
             assert_eq!(kind, Some("task_started".to_string()));
